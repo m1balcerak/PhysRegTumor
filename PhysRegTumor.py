@@ -61,7 +61,7 @@ global CM_pos
 global unet_w
 
 global pet_w
-pet_w = 1.0
+pet_w = 0.8
 
 # Regularization factors for spatial and temporal components
 global TS, kxreg, ktreg
