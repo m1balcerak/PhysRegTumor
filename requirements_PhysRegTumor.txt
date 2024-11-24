@@ -1,0 +1,8 @@
+python==3.11.2
+tensorflow==2.18.0
+tensorflow-estimator==2.18.0
+tensorflow-io-gcs-filesystem==0.37.1
+scikit-learn==1.5.2
+scikit-image==0.24.0
+matplotlib==3.9.2
+nibabel==5.3.2

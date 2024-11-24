@@ -8,7 +8,7 @@ from scipy.ndimage import zoom, center_of_mass
 from scipy.interpolate import griddata
 
 import nibabel as nib
-from forwardFK_FDM.solver import solver
+from FK import Solver
 
 import argparse
 import numpy as np
@@ -2191,7 +2191,8 @@ def make_problem(args):
     'dz_mm': dz,
     'init_scale': 0.8
     }
-    result = solver(parameters)
+    sol = Solver(parameters)
+    result = sol.solve()
     FK_ts = np.array(result['time_series']).astype(dtype)
     
     # Create an array of zeros with the same shape as one time step
