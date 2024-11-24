@@ -8,6 +8,10 @@ If you have any suggestions or encounter difficulties, feel free to reach out vi
 
 ![Overview](thumbnail.png)
 ---
+## Synthetic Data
+
+If you want an easy jupyternotebook with synthetic data playground go to: https://github.com/m1balcerak/TumorGrowthToolkit
+
 
 ## Required Packages
 
