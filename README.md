@@ -6,6 +6,7 @@
 If you have any suggestions or encounter difficulties, feel free to reach out via email at:  
 [email_michal](mailto:michal.balcerak@uzh.ch)
 
+![Overview](thumbnail.png)
 ---
 
 ## Required Packages
