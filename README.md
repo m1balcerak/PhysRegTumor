@@ -72,6 +72,30 @@ To run the project, follow these steps:
 
 This framework requires a dataset to work with. The dataset used in this project can be found at the following link:
 
-[GliODIL Dataset on Hugging Face](https://huggingface.co/datasets/m1balcerak/GliODIL)
+[GliODIL Dataset](https://huggingface.co/datasets/m1balcerak/GliODIL)
 
 ---
+## Citation
+
+If you find this work useful, please consider citing it:
+
+```bibtex
+@article{balcerak2024physics,
+  title={Physics-Regularized Multi-Modal Image Assimilation for Brain Tumor Localization},
+  author={Balcerak, Michal and Amiranashvili, Tamaz and Wagner, Andreas and Weidner, Jonas and Karnakov, Petr and Paetzold, Johannes C and Ezhov, Ivan and Koumoutsakos, Petros and Wiestler, Benedikt and Menze, Bjoern},
+  journal={arXiv preprint arXiv:2409.20409},
+  year={2024}
+}
+```
+
+If you use the dataset, please also cite its source:
+
+```bibtex
+@article{balcerak2023individualizing,
+  title={Individualizing glioma radiotherapy planning by optimization of a data and physics informed discrete loss},
+  author={Balcerak, Michal and Ezhov, Ivan and Karnakov, Petr and Litvinov, Sergey and Koumoutsakos, Petros and Weidner, Jonas and Zhang, Ray Zirui and Lowengrub, John S and Wiestler, Bene and Menze, Bjoern},
+  journal={arXiv preprint arXiv:2312.05063},
+  year={2023}
+}
+```
+
