@@ -1,7 +1,6 @@
 # PhysRegTumor
 **Physics-Regularized Multi-Modal Image Assimilation for Brain Tumor Localization**  
 (NeurIPS 2024)  
-**UNDER CONSTRUCTION v.01**
 
 If you have any suggestions or encounter difficulties, feel free to reach out via email at:  
 [email_michal](mailto:michal.balcerak@uzh.ch)
