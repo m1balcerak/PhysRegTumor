@@ -6,106 +6,72 @@ import matplotlib.pyplot as plt
 plt.rcParams["font.family"] = "DejaVu Sans"
 from scipy.ndimage import zoom, center_of_mass
 from scipy.interpolate import griddata
-from scipy.ndimage import binary_erosion
-from scipy.stats import pearsonr
 
 import nibabel as nib
-from TumorGrowthToolkit.FK_2c import Solver
-
+from forwardFK_FDM.solver import solver
 
 import argparse
-import time
 import numpy as np
 import os
 from functools import partial
 import odil
 from odil.runtime import tf
-
+from data_processing import correct_outside_skull_mask
 
 
 printlog = odil.util.printlog
-global wm_data, gm_data, csf_data, segm_data, pet_data, dtype, gamma, gamma_ch
-global D_ch, R_ch, rho_ch, matter_th, c_init, pet_w, CM_pos, TS, kxreg, ktreg, decay_period
-global BC_w, pde_w, balance_w, neg_w, enhancing_w, edema_w, outside_w, params_w, symmetry_w
-global th_necro_ch, th_enhancing_ch, th_edema_ch
 
-# General
-params_w = 30
-neg_w = 0 
+# Data tensors
+global wm_data, gm_data, csf_data, segm_data, pet_data
+
 # Material properties
+global dtype, gamma, gamma_ch
 dtype = np.float32
-gamma_ch = -1.5
-# PDE
-max_stopping_time = 120
-base_scale = 0.8
-BC_w = 16
-pde_w = 750
-# For dynamical tissues
-balance_w = 15
-kxreg = 3
-ktreg = 1550
-decay_period = 0
-symmetry_w = 0.5
-# Characteristic params
-D_ch = 0.15
-R_ch = 25
-rho_ch = 0.15
+gamma_ch = -2
+gamma = tf.constant(1.0, dtype=dtype) * (-1.) * gamma_ch
+
+# Weights for different components of the model
+global BC_w, pde_w, balance_w, neg_w, core_w, edema_w, outside_w, params_w, symmetry_w
+BC_w = 850
+pde_w = 60000
+balance_w = 215
+neg_w = 80
+core_w = 13.5
+edema_w = 13.5
+outside_w = 13.5
+params_w = 98
+symmetry_w = 3.2
+
+# Diffusion and reaction parameters
+global D_ch, R_ch, rho_ch, matter_th
+D_ch = 0.13
+R_ch = 21
+rho_ch = 0.06
 matter_th = 0.1
-th_necro = 0.9
-lambda_np_ch = 0.5
-sigma_np_ch = 0.4
-lambda_s_ch = 0.08
-D_s_ch = 0.5
-# Data fit
-th_necro_ch = 0.30
-th_enhancing_ch = 0.65
-th_edema_ch = 0.20
-pet_w = 0
-necro_w = 6 
-enhancing_w = 3 
-edema_w = 1 
-outside_w = 1
 
+# Initial and threshold settings
+global c_init, th_down_s, th_up_s
+th_down_s = 0.22
+th_up_s = 0.62
 
+# Control points and tissue segmentation weights
+global CM_pos
 
-global outside_matter_mask, init_scale_value
+# UNet model weight
+global unet_w
 
-def smooth_heaviside(x, sigma_np, mod=tf, k=50):
-    return 1- 1 / (1 + mod.exp(-k * (x - sigma_np)))
+global pet_w
+pet_w = 1.0
 
-def calculate_init_scale(x, base_scale=base_scale):
-    """
-    Calculate the init_scale based on the first three dimensions of the input tensor.
-    Calibrated to return base_scale when resolution is 72^3.
-    
-    Args:
-    x (tf.Tensor): Input tensor with shape [..., time].
-    base_scale (float): Base scaling factor, defaults to 0.8.
-    
-    Returns:
-    tf.Tensor: Calculated init_scale.
-    """
-    # Get the shape of x and take only the first three dimensions
-    spatial_shape = tf.shape(x)[:3]
-    
-    # Calculate the number of spatial points
-    num_spatial_points = tf.reduce_prod(tf.cast(spatial_shape, tf.float32))
-    
-    # Calculate the scaling factor
-    # We use 72^3 as our reference point
-    scaling_factor = tf.pow(num_spatial_points / (72.0 ** 3), 1/3)
-    
-    # Calculate init_scale
-    return base_scale * scaling_factor
+# Regularization factors for spatial and temporal components
+global TS, kxreg, ktreg
+kxreg = 10
+ktreg = 75
 
-def gauss_sol3d_tf(x, y, z, dx, dy, dz):
+def gauss_sol3d_tf(x, y, z, dx, dy, dz, init_scale):
     # Experimentally chosen
     Dt = 5.0
     M = 250
-
-    # Calculate init_scale using the external function
-    # We can pass x here as the function now only considers spatial dimensions
-    init_scale = init_scale_value
 
     # Apply scaling to the coordinates
     x_scaled = x * dx / init_scale
@@ -117,7 +83,7 @@ def gauss_sol3d_tf(x, y, z, dx, dy, dz):
 
     # Apply thresholds
     gauss = tf.where(gauss > 0.1, gauss, tf.zeros_like(gauss))
-    gauss = tf.where(gauss > 1, tf.ones_like(gauss), gauss)
+    gauss = tf.where(gauss > 1, tf.ones_like(gauss, dtype=dtype), gauss)
 
     return gauss
 
@@ -152,63 +118,19 @@ def unet_loss(unet_data, c_field, th_low):
     return normalized_loss
 
 
+def transform_c(c, mod):
+    global outside_skull_mask
 
-def reduce_outer_shell(mask):
-    """
-    Reduce the outer shell of the brain mask by one voxel while keeping the internal CSF voxels unchanged.
-
-    Parameters:
-    mask (numpy.ndarray): 3D numpy array with 1s indicating non-brain regions and CSF, and 0s indicating brain matter.
-
-    Returns:
-    numpy.ndarray: Modified mask with the outer shell reduced by one voxel.
-    """
-    # Create a structure element for the erosion
-    structuring_element = np.ones((3, 3, 3))
-
-    # Perform binary erosion
-    eroded_mask = binary_erosion(mask, structure=structuring_element)
-
-    # Keep the internal CSF 1s unchanged
-    # Mask the eroded outer shell back into the original mask
-    result_mask = np.where(mask == 0, 0, eroded_mask)
-
-    return result_mask
-
-def transform_c(c, mod, initial_value=0, repeat=False):
-    global outside_matter_mask, outside_skull_mask
-    #if initial_value != 0:
-        #zero_mask = reduce_outer_shell(outside_matter_mask) #TRY
-    #else:
-    zero_mask = outside_matter_mask
-    # Ensure that the outside_matter_mask is zero outside of the skull.
-    c_masked = c * (1 - zero_mask)
-    # Create a tensor filled with the initial_value
-    initial_tensor = mod.ones_like(c) * initial_value
-    # Apply the outside_matter_mask to the initial tensor to ensure zeros outside the skull
-    initial_tensor_masked = initial_tensor * (1 - zero_mask)
-    # Combine the initial tensor with the masked c tensor
+    # Use the outside_skull_mask to set c to zero outside of the skull.
+    # This is achieved by multiplying c with the inverted mask (where outside of the skull is zero).
+    c_masked = c * (1 - outside_skull_mask)
+    # Zero the tumor cells for the initial time step.
     if mod == np:
-        if repeat:
-            c_combined = np.where((c == c[0]) | (c == c[1]), initial_tensor_masked, c_masked)
-        else:
-            c_combined = np.where(c == c[0], initial_tensor_masked, c_masked)
+        c_masked = np.concatenate([c_masked[:0], np.zeros_like(c_masked)[:1], c_masked[1:]], axis=0)
     else:
-        if repeat:
-            c_combined = tf.where(tf.logical_or(tf.equal(c, c[0]), tf.equal(c, c[1])), initial_tensor_masked, c_masked)
-        else:
-            c_combined = tf.where(tf.equal(c, c[0]), initial_tensor_masked, c_masked)
+        c_masked = tf.concat([c_masked[:0], tf.zeros_like(c_masked)[:1], c_masked[1:]], axis=0)
     
-    # Ensure that the output values are not below 0
-    if mod == np:
-        c_combined = np.maximum(c_combined, 0)
-    else:
-        c_combined = tf.maximum(c_combined, 0)
-    
-    return c_combined
-
-def transform_c2(c, mod, initial_value=0, repeat=False):    
-    return c
+    return c_masked
 
 
 def transform_txyz(tx, ty, tz, x, y, z, mod):
@@ -279,7 +201,7 @@ def transform_txyz2(tx, ty, tz, x, y, z, mod):
     return tx, ty, tz
 
 
-def transform_txyz3(tx, ty, tz, x, y, z, mod):
+def transform_txyz2(tx, ty, tz, x, y, z, mod):
     return x, y, z
 
 
@@ -466,21 +388,13 @@ def calculate_dice_scores(segm, coeff, c_euler_slice):
 
     return dice_score_edema, dice_score_core
 
-def get_core_mask(segm, mod=tf):
+def get_core_mask(segm,mod=tf):
     # Use TensorFlow operations for logical or and equality checks
-    return mod.logical_or(get_enhancing_mask(segm, mod), get_necrotic_mask(segm, mod))
-
-def get_enhancing_mask(segm, mod=tf):
-    # Use TensorFlow operations for logical or and equality checks
-    return mod.equal(segm, 1)
-
-def get_necrotic_mask(segm, mod=tf):
-    # Use TensorFlow operations for logical or and equality checks
-    return mod.equal(segm, 4)
+    return tf.logical_or(tf.equal(segm, 1), tf.equal(segm, 4))
 
 def get_edema_mask(segm,mod=tf):
     # Use TensorFlow operation for equality check
-    return mod.equal(segm, 3)
+    return tf.equal(segm, 3)
 
 
 def get_core_loss_tf(c, th_up, segm):
@@ -492,34 +406,6 @@ def get_core_loss_tf(c, th_up, segm):
                          tf.zeros_like(core_mask, dtype=tf.float32))
 
     return core_loss
-
-def get_enhancing_loss_tf(c, th_up, segm):
-    core_mask = get_enhancing_mask(segm)
-
-    # Compute the core loss where core_mask is True, else set to 0
-    core_loss = tf.where(core_mask,
-                         tf.clip_by_value(th_up - c, clip_value_min=0, clip_value_max=tf.float32.max),
-                         tf.zeros_like(core_mask, dtype=tf.float32))
-
-    return core_loss
-
-def get_necrotic_loss_tf(c, th_up, segm):
-    core_mask = get_necrotic_mask(segm)
-    
-    # Compute the loss for cells below the threshold in necrotic regions
-    below_th_loss = tf.where(core_mask,
-                             tf.clip_by_value(th_up - c, clip_value_min=0, clip_value_max=tf.float32.max),
-                             tf.zeros_like(core_mask, dtype=tf.float32))
-    
-    # Compute the loss for cells above the threshold in non-necrotic regions
-    above_th_loss = tf.where(tf.logical_not(core_mask),
-                             tf.clip_by_value(c - th_up, clip_value_min=0, clip_value_max=tf.float32.max),
-                             tf.zeros_like(core_mask, dtype=tf.float32))
-    
-    # Combine both losses
-    total_loss = below_th_loss + above_th_loss
-    
-    return total_loss
 
 def get_edema_loss_tf(c, th_down, th_up, segm):
     edema_mask = get_edema_mask(segm)
@@ -538,7 +424,8 @@ def get_edema_loss_tf(c, th_down, th_up, segm):
     return edema_loss
 
 def get_outside_segm_mask(segm, mod=tf):
-    return mod.equal(segm, 0)
+    # Use TensorFlow operation for equality check
+    return tf.equal(segm, 0)
 
 def get_outside_segm_loss_tf(c, th_down, segm):
     outside_segm_mask = get_outside_segm_mask(segm)
@@ -661,159 +548,6 @@ def get_D(WM, GM, th, Dw, Dw_ratio):
     
     return {"D_minus_x": D_minus_x, "D_minus_y": D_minus_y, "D_minus_z": D_minus_z,"D_plus_x": D_plus_x, "D_plus_y": D_plus_y, "D_plus_z": D_plus_z}
 
-def m_Tildas_with_necro(WM, GM, PC, PN, th, th_necro):
-    # Cast all inputs to tf.float32 to ensure consistency
-    WM = tf.cast(WM, tf.float32)
-    GM = tf.cast(GM, tf.float32)
-    PC = tf.cast(PC, tf.float32)
-    PN = tf.cast(PN, tf.float32)
-    th = tf.cast(th, tf.float32)
-    th_necro = tf.cast(th_necro, tf.float32)
-
-    # Helper function to create combined conditions for each axis
-    def combined_condition(axis):
-        roll_func = lambda x, shift, axis: tf.roll(x, shift, axis)
-        logical_and_func = tf.logical_and
-
-        matter_cond = logical_and_func(roll_func(WM + GM, -1, axis=axis) >= th, WM + GM >= th)
-        full_region_cond = logical_and_func(roll_func(PC + PN, -1, axis=axis) <= th_necro, PC + PN <= th_necro)
-        return logical_and_func(matter_cond, full_region_cond)
-
-    # Combined conditions for x, y, z axes
-    combined_cond_x = combined_condition(0)
-    combined_cond_y = combined_condition(1)
-    combined_cond_z = combined_condition(2)
-
-    WM_tilda_x = tf.where(combined_cond_x, (tf.roll(WM, -1, axis=0) + WM) / 2, tf.zeros_like(WM))
-    WM_tilda_y = tf.where(combined_cond_y, (tf.roll(WM, -1, axis=1) + WM) / 2, tf.zeros_like(WM))
-    WM_tilda_z = tf.where(combined_cond_z, (tf.roll(WM, -1, axis=2) + WM) / 2, tf.zeros_like(WM))
-
-    GM_tilda_x = tf.where(combined_cond_x, (tf.roll(GM, -1, axis=0) + GM) / 2, tf.zeros_like(GM))
-    GM_tilda_y = tf.where(combined_cond_y, (tf.roll(GM, -1, axis=1) + GM) / 2, tf.zeros_like(GM))
-    GM_tilda_z = tf.where(combined_cond_z, (tf.roll(GM, -1, axis=2) + GM) / 2, tf.zeros_like(GM))
-
-    return {
-        "WM_t_x": WM_tilda_x, "WM_t_y": WM_tilda_y, "WM_t_z": WM_tilda_z,
-        "GM_t_x": GM_tilda_x, "GM_t_y": GM_tilda_y, "GM_t_z": GM_tilda_z
-    }
-
-def get_D_with_necro(WM, GM, th, Dw, Dw_ratio, PC, NC, th_necro):
-    # Cast Dw and Dw_ratio to tf.float32
-    Dw = tf.cast(Dw, tf.float32)
-    Dw_ratio = tf.cast(Dw_ratio, tf.float32)
-
-    M = m_Tildas_with_necro(WM, GM, PC, NC, th, th_necro)
-
-    D_minus_x = Dw * (M["WM_t_x"] + M["GM_t_x"] / Dw_ratio)
-    D_minus_y = Dw * (M["WM_t_y"] + M["GM_t_y"] / Dw_ratio)
-    D_minus_z = Dw * (M["WM_t_z"] + M["GM_t_z"] / Dw_ratio)
-
-    D_plus_x = Dw * (tf.roll(M["WM_t_x"], 1, axis=0) + tf.roll(M["GM_t_x"], 1, axis=0) / Dw_ratio)
-    D_plus_y = Dw * (tf.roll(M["WM_t_y"], 1, axis=1) + tf.roll(M["GM_t_y"], 1, axis=1) / Dw_ratio)
-    D_plus_z = Dw * (tf.roll(M["WM_t_z"], 1, axis=2) + tf.roll(M["GM_t_z"], 1, axis=2) / Dw_ratio)
-
-    return {"D_minus_x": D_minus_x, "D_minus_y": D_minus_y, "D_minus_z": D_minus_z,
-            "D_plus_x": D_plus_x, "D_plus_y": D_plus_y, "D_plus_z": D_plus_z}
-    
-    
-def get_epoch_factor(epoch, period):
-    # Calculate the scaling factor using exponential decay
-    # The factor halves every 'period' epochs
-    if period > 0:
-        return 0.5 ** (epoch / period)
-    else:
-        return 1.0
-
-
-
-def get_combined_params_loss(
-    D_scalar, rho, gamma, th_edema, th_enhancing, th_necrotic,
-    lambda_s, R_coeff, D_s,lambda_np,sigma_np, params_w
-):
-    losses = []
-    # Define parameter constraints
-    constraints = [
-        (D_scalar, tf.constant(0.03, dtype=tf.float32), None),  # Only lower bound
-        (rho, tf.constant(0.02, dtype=tf.float32), None),  # Only lower bound
-        (gamma, None, tf.constant(-1.5, dtype=tf.float32)),  # Only upper bound
-        (th_edema, tf.constant(0.15, dtype=tf.float32), tf.constant(0.30, dtype=tf.float32)),
-        (th_enhancing, tf.constant(0.40, dtype=tf.float32), tf.constant(0.60, dtype=tf.float32)),
-        (th_necrotic, tf.constant(0.05, dtype=tf.float32), tf.constant(0.30, dtype=tf.float32)),
-        (lambda_s, tf.constant(0.02, dtype=tf.float32), tf.constant(0.5, dtype=tf.float32)),
-        (R_coeff, tf.constant(10.0, dtype=tf.float32), tf.constant(1000.0, dtype=tf.float32)),
-        (D_s, tf.constant(0.1, dtype=tf.float32), tf.constant(1.0, dtype=tf.float32)),
-        (lambda_np, tf.constant(0.1, dtype=tf.float32), tf.constant(1.0, dtype=tf.float32)),
-        (sigma_np, tf.constant(0.1, dtype=tf.float32), tf.constant(1.0, dtype=tf.float32))
-    ]
-    
-
-    for param, lower_bound, upper_bound in constraints:
-        if lower_bound is not None:
-            losses.append(tf.clip_by_value(lower_bound - param, tf.constant(0.0, dtype=tf.float32), tf.constant(100.0, dtype=tf.float32)) * params_w)
-        if upper_bound is not None:
-            losses.append(tf.clip_by_value(param - upper_bound, tf.constant(0.0, dtype=tf.float32), tf.constant(100.0, dtype=tf.float32)) * params_w)
-    
-    # Combine all losses
-    final_loss = tf.reduce_sum(losses)
-    return final_loss
-
-def particles_to_field_tf(field, tx_slice, ty_slice, tz_slice, domain):
-    dx = domain.step('x')
-    dy = domain.step('y')
-    dz = domain.step('z')
-    nx = domain.size('x')
-    ny = domain.size('y')
-    nz = domain.size('z')
-
-    # Offset from corner cell center in x, y, and z dimensions.
-    dtx = tx_slice / dx - 0.5
-    dty = ty_slice / dy - 0.5
-    dtz = tz_slice / dz - 0.5
-
-    # Indices for x, y, and z dimensions.
-    tix = tf.clip_by_value(tf.cast(tf.floor(dtx), tf.int32), 0, nx - 1)
-    tiy = tf.clip_by_value(tf.cast(tf.floor(dty), tf.int32), 0, ny - 1)
-    tiz = tf.clip_by_value(tf.cast(tf.floor(dtz), tf.int32), 0, nz - 1)
-    tixp = tix + 1
-    tiyp = tiy + 1
-    tizp = tiz + 1
-
-    # Weights for x, y, and z dimensions.
-    sx1 = tf.clip_by_value(dtx - tf.cast(tix, tf.float32), 0, 1)
-    sy1 = tf.clip_by_value(dty - tf.cast(tiy, tf.float32), 0, 1)
-    sz1 = tf.clip_by_value(dtz - tf.cast(tiz, tf.float32), 0, 1)
-    sx0 = 1 - sx1
-    sy0 = 1 - sy1
-    sz0 = 1 - sz1
-
-    # Create an empty grid
-    grid = tf.zeros((nx, ny, nz), dtype=field.dtype)
-
-    # Accumulate contributions from each particle
-    def scatter_add(grid, indices, updates):
-        shape = tf.shape(grid)
-        flat_shape = [tf.reduce_prod(shape)]
-        flat_indices = tf.reshape(indices, [-1, 3])
-        flat_indices = tf.reduce_sum(flat_indices * [shape[1] * shape[2], shape[2], 1], axis=-1)
-        flat_grid = tf.reshape(grid, flat_shape)
-        flat_grid = tf.tensor_scatter_nd_add(flat_grid, tf.expand_dims(flat_indices, axis=-1), tf.reshape(updates, [-1]))
-        return tf.reshape(flat_grid, shape)
-
-    for i, j, k, w in [
-        (tix, tiy, tiz, sx0 * sy0 * sz0),
-        (tixp, tiy, tiz, sx1 * sy0 * sz0),
-        (tix, tiyp, tiz, sx0 * sy1 * sz0),
-        (tixp, tiyp, tiz, sx1 * sy1 * sz0),
-        (tix, tiy, tizp, sx0 * sy0 * sz1),
-        (tixp, tiy, tizp, sx1 * sy0 * sz1),
-        (tix, tiyp, tizp, sx0 * sy1 * sz1),
-        (tixp, tiyp, tizp, sx1 * sy1 * sz1),
-    ]:
-        indices = tf.stack([i, j, k], axis=-1)
-        updates = field * w
-        grid = scatter_add(grid, indices, updates)
-
-    return grid
 
 def operator_adv(ctx):
     global gamma, BC_w, pde_w, balance_w, neg_w, D_ch, R_ch, outside_skull_mask, neg_w,CM_pos, pet_w
@@ -821,15 +555,15 @@ def operator_adv(ctx):
     dx = ctx.step('x')
     dy = ctx.step('y')
     dz = ctx.step('z')
-    x = ctx.points('x', loc='cccc')
-    y = ctx.points('y', loc='cccc')
-    z = ctx.points('z', loc='cccc')
+    x = ctx.points('x')
+    y = ctx.points('y')
+    z = ctx.points('z')
 
     nt = ctx.size('t')
     nx = ctx.size('x')
     ny = ctx.size('y')
     nz = ctx.size('z')
-    current_epoch = ctx.tracers['epoch']    
+    
 
     def single_var(key, st=0, sx=0, sy=0, sz=0):
         u = ctx.field(key, st, sx, sy, sz)
@@ -855,7 +589,7 @@ def operator_adv(ctx):
             (tix, tiyp, tizp, sx0 * sy1 * sz1),
             (tixp, tiyp, tizp, sx1 * sy1 * sz1),
         ]:
-            idx = tf.stack([jx[it] + 1, jy[it] + 1, jz[it] + 1], axis=-1) #test stop gradient
+            idx = tf.stack([jx[it] + 1, jy[it] + 1, jz[it] + 1], axis=-1)
             qp += jw[it] * tf.gather_nd(q_src, idx)
         return qp
 
@@ -929,22 +663,16 @@ def operator_adv(ctx):
     tx, ty, tz = transform_txyz(tx, ty, tz, x, y, z, tf)
     
     # Tumor
-    c_p = single_var('c_p')
-    c_p = transform_c(c_p, mod=tf)
-    
-    c_n = single_var('c_n')
-    c_n = transform_c(c_n, mod=tf,repeat=True)
-    
-    c_s = single_var('c_s')
-    c_s = transform_c(c_s, mod=tf,initial_value=1,repeat=True)    
+    c = single_var('c')
+    c = transform_c(c, mod=tf)
 
     # Cell indices.
     dtx = tx / dx - 0.5
     dty = ty / dy - 0.5
     dtz = tz / dz - 0.5
-    tix = tf.clip_by_value(ctx.cast(tf.floor(dtx), tf.int32), -1, nx - 1) #test stop gradient
-    tiy = tf.clip_by_value(ctx.cast(tf.floor(dty), tf.int32), -1, ny - 1) #test stop gradient
-    tiz = tf.clip_by_value(ctx.cast(tf.floor(dtz), tf.int32), -1, nz - 1) #test stop gradient
+    tix = tf.clip_by_value(ctx.cast(tf.floor(dtx), tf.int32), -1, nx - 1)
+    tiy = tf.clip_by_value(ctx.cast(tf.floor(dty), tf.int32), -1, ny - 1)
+    tiz = tf.clip_by_value(ctx.cast(tf.floor(dtz), tf.int32), -1, nz - 1)
     tixp = tix + 1
     tiyp = tiy + 1
     tizp = tiz + 1
@@ -959,55 +687,40 @@ def operator_adv(ctx):
    
     # Get white matter intensities at particle locations
 
-    #'coeff': odil.Array([D_ch, rho_ch, int(CM_pos[0]), int(CM_pos[1]), int(CM_pos[2]), th_edema_ch, th_enhancing_ch, th_necro_ch, lambda_s_ch, R_ch, D_s_ch, gamma_ch])
+
     D_scalar = coeff[0]
     rho = coeff[1]
-    
     x0 = coeff[2]
     y0 = coeff[3]
     z0 = coeff[4]
+    gamma = tf.constant(1.0,dtype=dtype)*coeff[7]
+    th_down = coeff[5]
+    th_up = coeff[6]
     
-    th_edema = th_edema_ch#coeff[5]
-    th_enhancing = th_enhancing_ch#coeff[6]
-    th_necrotic = th_necro_ch#coeff[7]
-    
-
-    lambda_s = coeff[8]
-    R_coeff = coeff[9]
-    
-    D_s = coeff[10]
-    gamma = coeff[11]#tf.constant(-1.2,dtype=dtype)
-    
-    lambda_np = coeff[12]
-    sigma_np = coeff[13]
     # Clip th_down values
     # Ensuring th_down is no less than 0.20 and no more than 0.35
-    #th_down = tf.clip_by_value(coeff[5], clip_value_min=0.20, clip_value_max=0.35)
+    th_down = tf.clip_by_value(coeff[5], clip_value_min=0.20, clip_value_max=0.35)
 
     # Clip th_up values
     # Ensuring th_up is no less than 0.50 and no more than 0.85
-    #th_up = tf.clip_by_value(coeff[6], clip_value_min=0.50, clip_value_max=0.85)
+    th_up = tf.clip_by_value(coeff[6], clip_value_min=0.50, clip_value_max=0.85)
     
     
     # Get the spatially-varying diffusion coefficient based on wm_intensities
-    D_domain = get_D_with_necro(wm_data,gm_data,matter_th,D_scalar,R_coeff, c_p, c_n, th_necro)
-    D_s_domain = get_D(wm_data, gm_data, matter_th, D_s, 1)
-
+    D = get_D(wm_data, gm_data, matter_th, D_scalar, R_ch)
+    
     # Calculate the tumor pde loss
-    #pde_loss = tumor_pde_loss(tx, ty, tz, dt, c_p, D,rho)
-    pde_loss_p, pde_loss_n, pde_loss_s = tumor_pde_loss(tx, ty, tz, dt, c_p, c_n, c_s, D_domain, D_s_domain, rho, lambda_np, lambda_s, sigma_np)
-    res += [pde_loss_p*pde_w]
-    res += [pde_loss_n*pde_w]
-    res += [pde_loss_s*pde_w]
+    pde_loss = tumor_pde_loss(tx, ty, tz, dt, c, D,rho)
+    res += [pde_loss*pde_w]
     
-    #BC for p
-    c_init = gauss_sol3d_tf((tx[1,:]-x0-dx/2),(ty[1,:]-y0-dy/2),(tz[1,:]-z0-dz/2),dx,dy,dz)
-    c_init_lagrange = particles_to_field_tf(c_init,tx[1],ty[1],tz[1],ctx.domain)
-    #c_init_lagrange = c_init #better for the init tissues
-    bc = c_p[1] - c_init_lagrange
+    #BC
+    c_init = gauss_sol3d_tf((x[0,:]-x0),(y[0,:]-y0),(z[0,:]-z0),dx,dy,dz,init_scale=0.8)
+    #c_init_lagrange = field_to_particles_3d(c_init,1)
+    c_init_lagrange = c_init #better for the init tissues
+    bc = c[1] - c_init_lagrange
     res += [bc*BC_w]
-    
-
+    bc0 = c[0]
+    res += [bc0*BC_w]
     
 
     
@@ -1016,40 +729,44 @@ def operator_adv(ctx):
     E = compute_strain_tensor_lagrangian_full(ux, uy, uz, ctx)
     
     
-    lambda_vals = compute_lambda(wm_data, gm_data, csf_data, c_p+c_n)
+    lambda_vals = compute_lambda(wm_data, gm_data, csf_data, c)
     lambda_vals = lambda_vals / tf.reduce_max(lambda_vals)
-    mu_vals = compute_mu(wm_data, gm_data, csf_data, c_p+c_n)
+    mu_vals = compute_mu(wm_data, gm_data, csf_data, c)
     mu_vals = mu_vals / tf.reduce_max(mu_vals)
     
     #calculate the balance residual
-    res_balance = compute_strain_balance_tf(E,c_p+c_n,gamma,lambda_vals,mu_vals,ctx)
+    res_balance = compute_strain_balance_tf(E,c,gamma,lambda_vals,mu_vals,ctx)
     res += [res_balance*balance_w]
     
+    #static tissues:
+    #res += [[tx - x,ty - y,tz - z]]*w_static_tissues
+    #negative tumor
+    res +=  [(c - tf.abs(c))*neg_w]
+    
+    #outside of matter mask
+    combined_matter = wm_data + gm_data
+    combined_matter_mask = (combined_matter < matter_th).astype(int)
+    # Repeat the combined_matter_mask across the time dimension
+    combined_matter_mask_4d = np.repeat(combined_matter_mask[np.newaxis, :, :], nt, axis=0)
+    res += [c * combined_matter_mask_4d * outside_w]
     
     #Data fit
-    c_p_euler = particles_to_field_tf(c_p[-1],tx[-1],ty[-1],tz[-1],ctx.domain)
-    c_n_euler = particles_to_field_tf(c_n[-1],tx[-1],ty[-1],tz[-1],ctx.domain)
+    c_euler = particles_to_field_3d_average(c[-1],tx[-1],ty[-1],tz[-1],ctx.domain)
+    res += [get_outside_segm_loss_tf(c_euler,th_down,segm_data)*outside_w]
+    res += [get_edema_loss_tf(c_euler,th_down,th_up,segm_data)*edema_w]
+    res += [get_core_loss_tf(c_euler,th_up,segm_data)*core_w]
     
-    res += [get_outside_segm_loss_tf(c_p_euler,th_edema,segm_data)*outside_w]
-    res += [get_edema_loss_tf(c_p_euler,th_edema,th_enhancing,segm_data)*edema_w]
-    res += [get_enhancing_loss_tf(c_p_euler,th_enhancing,segm_data)*enhancing_w]
-    res += [get_necrotic_loss_tf(c_n_euler,th_necrotic,segm_data)*necro_w]
+
     
-    # PET loss
-    res += [pet_loss(pet_data, segm_data, c_p_euler)*pet_w]
-    
-    # plausible region for the parameters loss
-    res += [get_combined_params_loss(D_scalar, rho, gamma, th_edema, th_enhancing, th_necrotic, lambda_s, R_coeff, D_s, lambda_np, sigma_np, params_w)]
-    
-    epoch_decay_factor = tf.cast(get_epoch_factor(current_epoch, decay_period), tf.float32)
+    res += [tf.clip_by_value(0.11 - D_scalar ,0,100)*params_w]
+    res += [tf.clip_by_value(0.02 - rho ,0,100)*params_w]
+    res += [tf.clip_by_value(1.5 + gamma ,0,100)*params_w]
     
     # Smoothness of particles in space.
-    ltx = laplace_roll(tx) * kxreg * epoch_decay_factor
-    lty = laplace_roll(ty) * kxreg * epoch_decay_factor
-    ltz = laplace_roll(tz) * kxreg * epoch_decay_factor
+    ltx = laplace_roll(tx) * kxreg
+    lty = laplace_roll(ty) * kxreg
+    ltz = laplace_roll(tz) * kxreg
     res += [ltx, lty, ltz]
-    #res += [ltx[1]*10, lty[1]*10, ltz[1]*10]
-
 
     # Smoothness of particles in time.
     txm = tf.roll(tx, shift=[1], axis=[0])
@@ -1062,16 +779,11 @@ def operator_adv(ctx):
 
     # Calculate residuals for x, y, and z dimensions
     res += [
-        ((txp - 2 * tx + txm) / dt**2)[1:-1] * ktreg * epoch_decay_factor,
-        ((typ - 2 * ty + tym) / dt**2)[1:-1] * ktreg * epoch_decay_factor,
-        ((tzp - 2 * tz + tzm) / dt**2)[1:-1] * ktreg * epoch_decay_factor,  
+        ((txp - 2 * tx + txm) / dt**2)[1:-1] * ktreg,
+        ((typ - 2 * ty + tym) / dt**2)[1:-1] * ktreg,
+        ((tzp - 2 * tz + tzm) / dt**2)[1:-1] * ktreg,  
     ]
     
-    # Brain looks symmetric at the beginning
-    healthy_wm = field_to_particles_3d(wm_data, nt-1)
-    healthy_gm = field_to_particles_3d(gm_data, nt-1)
-    healthy_csf = field_to_particles_3d(csf_data, nt-1)
-
     #brain looks simmetric at the beginning
     healthy_wm = field_to_particles_3d(wm_data,nt-1)
     for factor in [4, 8]:
@@ -1087,56 +799,24 @@ def operator_adv(ctx):
     for factor in [4, 8]:
         res += [calculate_symmetry_loss(healthy_csf, scale_factor=factor)*symmetry_w]
 
+    # Parameter loss
+    
+
+    
+    # normalize the loss constructed so far 
+    kappa = 3.0 # expected average value of res
+    # Divide each element in the list by kappa and multiply by (1-unet_w)
+    res = [x / kappa * (1-unet_w) for x in res]
+    
+
+    # add nnUnet loss 
+    #if unet_w > 0:
+    #    res += [unet_loss(unet_data, c_euler,th_down)*unet_w]
+    
+    # PET loss
+    res += [pet_loss(pet_data, segm_data, c_euler)*pet_w]
     
     return res
-
-def mirror_brain_tensor_np(tensor_3d, segm):
-    # Determine the shape of the tensor and segmentation map
-    x, y, z = tensor_3d.shape
-    segm_x, segm_y, segm_z = segm.shape
-    
-    # Get the tumor mask
-    tumor_mask = segm > 0
-    
-    # Sum the tumor segmentation along the x-axis to determine the tumor presence on each side
-    left_tumor_count = np.sum(tumor_mask[:segm_x//2, :, :])
-    right_tumor_count = np.sum(tumor_mask[segm_x//2:, :, :])
-    
-    # Determine the healthier side (less tumor presence)
-    if left_tumor_count < right_tumor_count:
-        # Left side is healthier, mirror it to the right
-        mirrored_side = tensor_3d[:x//2, :, :]
-        mirrored_tensor = np.concatenate([mirrored_side, mirrored_side[::-1, :, :]], axis=0)
-    else:
-        # Right side is healthier, mirror it to the left
-        mirrored_side = tensor_3d[x//2:, :, :]
-        mirrored_tensor = np.concatenate([mirrored_side[::-1, :, :], mirrored_side], axis=0)
-    
-    return mirrored_tensor
-
-def mirror_brain_tensor_tf(tensor_3d, segm):
-    # Determine the shape of the tensor and segmentation map
-    x, y, z = tensor_3d.shape
-    segm_x, segm_y, segm_z = segm.shape
-    
-    # Get the tumor mask
-    tumor_mask = segm > 0
-    
-    # Sum the tumor segmentation along the x-axis to determine the tumor presence on each side
-    left_tumor_count = tf.reduce_sum(tumor_mask[:segm_x//2, :, :])
-    right_tumor_count = tf.reduce_sum(tumor_mask[segm_x//2:, :, :])
-    
-    # Determine the healthier side (less tumor presence)
-    if left_tumor_count < right_tumor_count:
-        # Left side is healthier, mirror it to the right
-        mirrored_side = tensor_3d[:x//2, :, :]
-        mirrored_tensor = tf.concat([mirrored_side, tf.reverse(mirrored_side, axis=[0])], axis=0)
-    else:
-        # Right side is healthier, mirror it to the left
-        mirrored_side = tensor_3d[x//2:, :, :]
-        mirrored_tensor = tf.concat([tf.reverse(mirrored_side, axis=[0]), mirrored_side], axis=0)
-    
-    return mirrored_tensor
 
 def calculate_symmetry_loss(healthy, scale_factor=1):
     # Assuming healthy shape is [depth, height, width]
@@ -1389,61 +1069,40 @@ def compute_stress(E, lambda_, mu):
 
 
 
-def tumor_pde_loss(tx, ty, tz, dt, c_p, c_n, c_s, D, D_s, rho, lambda_np, lambda_s, sigma_np):
+def tumor_pde_loss(tx, ty, tz, dt, c, D,rho):
+    
     # Calculate the field residuals for the PDE
-    # First term of the PDE: time derivatives of c_p, c_n, and c_s
-    dc_p_dt = (c_p - tf.roll(c_p, shift=1, axis=0)) / dt
-    dc_n_dt = (c_n - tf.roll(c_n, shift=1, axis=0)) / dt
-    dc_s_dt = (c_s - tf.roll(c_s, shift=1, axis=0)) / dt
+    # First term of the PDE: time derivative of c
+    dc_dt = (c - tf.roll(c, shift=1, axis=0)) / dt
 
-    # Reaction terms (calculated at the mid-point in time)
-    c_p_mid = 0.5 * (c_p + tf.roll(c_p, shift=1, axis=0))
-    c_n_mid = 0.5 * (c_n + tf.roll(c_n, shift=1, axis=0))
-    c_s_mid = 0.5 * (c_s + tf.roll(c_s, shift=1, axis=0))
-
-    H = smooth_heaviside(c_s_mid, sigma_np)  # Use smooth Heaviside
-
-    Rpn = lambda_np * c_p_mid * H
-    reaction_p = rho * c_p_mid * c_s_mid * (1 - c_p_mid - c_n_mid) - Rpn
-    reaction_n = Rpn
-    reaction_s = -lambda_s * c_s_mid * c_p_mid
+    # Reaction term (calculated at the mid-point in time)
+    c_mid = 0.5 * (c + tf.roll(c, shift=1, axis=0))
+    reaction = tf.abs(c_mid) * (1 - c_mid) * rho
 
     # Calculate Δx, Δy, and Δz
     dx = (tf.roll(tx, shift=-1, axis=1) - tx)
     dy = (tf.roll(ty, shift=-1, axis=2) - ty)
     dz = (tf.roll(tz, shift=-1, axis=3) - tz)
 
-    # Calculate Δc in x, y, and z directions for c_p
-    dc_p_x = tf.roll(c_p, shift=-1, axis=1) - c_p
-    dc_p_y = tf.roll(c_p, shift=-1, axis=2) - c_p
-    dc_p_z = tf.roll(c_p, shift=-1, axis=3) - c_p
+    # Calculate Δc in x, y, and z directions
+    dc_x = tf.roll(c, shift=-1, axis=1) - c
+    dc_y = tf.roll(c, shift=-1, axis=2) - c
+    dc_z = tf.roll(c, shift=-1, axis=3) - c
 
-    diffusion_p_x = (D["D_minus_x"] * dc_p_x / dx - D["D_plus_x"] * tf.roll(dc_p_x / dx, shift=1, axis=1)) / ((dx + tf.roll(dx, shift=1, axis=1)) / 2)
-    diffusion_p_y = (D["D_minus_y"] * dc_p_y / dy - D["D_plus_y"] * tf.roll(dc_p_y / dy, shift=1, axis=2)) / ((dy + tf.roll(dy, shift=1, axis=2)) / 2)
-    diffusion_p_z = (D["D_minus_z"] * dc_p_z / dz - D["D_plus_z"] * tf.roll(dc_p_z / dz, shift=1, axis=3)) / ((dz + tf.roll(dz, shift=1, axis=3)) / 2)
     
-    diffusion_p = diffusion_p_x + diffusion_p_y + diffusion_p_z
-    diffusion_p = 0.5 * (diffusion_p + tf.roll(diffusion_p, shift=1, axis=0))  # Diffusion terms calculated at the mid-point in time
-
-    # Calculate Δc in x, y, and z directions for c_s
-    dc_s_x = tf.roll(c_s, shift=-1, axis=1) - c_s
-    dc_s_y = tf.roll(c_s, shift=-1, axis=2) - c_s
-    dc_s_z = tf.roll(c_s, shift=-1, axis=3) - c_s
-
-    diffusion_s_x = (D_s["D_minus_x"] * dc_s_x / dx - D_s["D_plus_x"] * tf.roll(dc_s_x / dx, shift=1, axis=1)) / ((dx + tf.roll(dx, shift=1, axis=1)) / 2)
-    diffusion_s_y = (D_s["D_minus_y"] * dc_s_y / dy - D_s["D_plus_y"] * tf.roll(dc_s_y / dy, shift=1, axis=2)) / ((dy + tf.roll(dy, shift=1, axis=2)) / 2)
-    diffusion_s_z = (D_s["D_minus_z"] * dc_s_z / dz - D_s["D_plus_z"] * tf.roll(dc_s_z / dz, shift=1, axis=3)) / ((dz + tf.roll(dz, shift=1, axis=3)) / 2)
+    diffusion_x = (D["D_minus_x"] * dc_x / dx - D["D_plus_x"]*tf.roll(dc_x / dx, shift=1, axis=1)) / ((dx + tf.roll(dx, shift=1, axis=1)) / 2)
+    diffusion_y = (D["D_minus_y"] * dc_y / dy - D["D_plus_y"]*tf.roll(dc_y / dy, shift=1, axis=2)) / ((dy + tf.roll(dy, shift=1, axis=2)) / 2)
+    diffusion_z = (D["D_minus_z"] * dc_z / dz - D["D_plus_z"]*tf.roll(dc_z / dz, shift=1, axis=3)) / ((dz + tf.roll(dz, shift=1, axis=3)) / 2)
     
-    diffusion_s = diffusion_s_x + diffusion_s_y + diffusion_s_z
-    diffusion_s = 0.5 * (diffusion_s + tf.roll(diffusion_s, shift=1, axis=0))  # Diffusion terms calculated at the mid-point in time
+    diffusion = diffusion_x + diffusion_y + diffusion_z
+    diffusion = 0.5 * (diffusion + tf.roll(diffusion, shift=1, axis=0))  # Diffusion terms calculated at the mid-point in time
 
-    # Total PDE losses
-    pde_loss_p = dc_p_dt - reaction_p - diffusion_p
-    pde_loss_n = dc_n_dt - reaction_n
-    pde_loss_s = dc_s_dt - reaction_s - diffusion_s
+    # Total PDE loss
+    pde_loss = dc_dt - reaction - diffusion
 
     # Exclude the boundary and first two time steps
-    return pde_loss_p[2:, 1:-1, 1:-1, 1:-1], pde_loss_n[2:, 1:-1, 1:-1, 1:-1], pde_loss_s[2:, 1:-1, 1:-1, 1:-1]
+    return pde_loss[2:, 1:-1, 1:-1, 1:-1]
+
 
 
 def initialize_c(nx, ny, nz, x_center, y_center, z_center, radius):
@@ -1475,20 +1134,11 @@ def initialize_c(nx, ny, nz, x_center, y_center, z_center, radius):
 
     return c_init.astype(dtype)
 
-def lagrange_to_euler_single_sliceX(c_lagrange, tx, ty, tz, domain, time_slice_index):
-    return c_lagrange[time_slice_index]
-
 
 def lagrange_to_euler_single_slice(c_lagrange, tx, ty, tz, domain, time_slice_index):
-    # Get the number of grid points along each dimension
     nx = domain.size('x')
     ny = domain.size('y')
     nz = domain.size('z')
-    
-    # Get the grid spacing along each dimension (Eulerian grid spacing)
-    dx = domain.step('x')
-    dy = domain.step('y')
-    dz = domain.step('z')
     
     # Placeholder for the Eulerian field values for a single time slice
     c_eulerian_slice = np.empty((nx, ny, nz))
@@ -1499,11 +1149,10 @@ def lagrange_to_euler_single_slice(c_lagrange, tx, ty, tz, domain, time_slice_in
     tz_flat = tz[time_slice_index].flatten()
     c_flat = c_lagrange[time_slice_index].flatten()
     
-    # Create a 3D grid for interpolation using the Eulerian grid spacing
-    x = np.arange(domain.lower[1] + dx/2, domain.upper[1], dx)
-    y = np.arange(domain.lower[2] + dy/2, domain.upper[2], dy)
-    z = np.arange(domain.lower[3] + dz/2, domain.upper[3], dz)
-    grid_x, grid_y, grid_z = np.meshgrid(x, y, z, indexing='ij')
+    # Create a 3D grid for interpolation
+    grid_x, grid_y, grid_z = np.mgrid[domain.lower[1]:domain.upper[1]:nx*1j, 
+                                      domain.lower[2]:domain.upper[2]:ny*1j, 
+                                      domain.lower[3]:domain.upper[3]:nz*1j]
     
     # Perform the interpolation for the specified time slice
     c_eulerian_slice = griddata((tx_flat, ty_flat, tz_flat), c_flat, (grid_x, grid_y, grid_z), method='nearest')
@@ -1513,37 +1162,61 @@ def lagrange_to_euler_single_slice(c_lagrange, tx, ty, tz, domain, time_slice_in
 
     return c_eulerian_slice
 
-
-def lagrange_to_euler_all_slices(c_lagrange, tx, ty, tz, domain, method='nearest'):
+from scipy.interpolate import NearestNDInterpolator
+def lagrange_to_euler_single_slice2(c_lagrange, tx, ty, tz, domain, time_slice_index):
     nx = domain.size('x')
     ny = domain.size('y')
     nz = domain.size('z')
-    nt = domain.size('t')
-    # Get the grid spacing along each dimension (Eulerian grid spacing)
-    dx = domain.step('x')
-    dy = domain.step('y')
-    dz = domain.step('z')
+
+    # Flatten the trajectories and field arrays for interpolation
+    points = np.array([tx[time_slice_index].flatten(), 
+                       ty[time_slice_index].flatten(), 
+                       tz[time_slice_index].flatten()]).T
+    values = c_lagrange[time_slice_index].flatten()
+
+    # Create an interpolator for the irregular grid
+    interpolator = NearestNDInterpolator(points, values)
+
+    # Create a regular grid for the Eulerian frame
+    grid_x, grid_y, grid_z = np.mgrid[domain.lower[1]:domain.upper[1]:nx*1j, 
+                                      domain.lower[2]:domain.upper[2]:ny*1j, 
+                                      domain.lower[3]:domain.upper[3]:nz*1j]
+
+    # Perform the interpolation onto the regular grid
+    c_eulerian_slice = interpolator(grid_x, grid_y, grid_z)
+
+    # Handle remaining NaNs in the result
+    c_eulerian_slice = np.nan_to_num(c_eulerian_slice, nan=0)
+
+    return c_eulerian_slice
+
+def lagrange_to_euler_all_slices(c_lagrange, tx, ty, tz, domain):
+    nx = domain.size('x')
+    ny = domain.size('y')
+    nz = domain.size('z')
+    nt = c_lagrange.shape[0]  # Assuming the first dimension of c_lagrange is time
+
     # Placeholder for the Eulerian field values for all time slices
     c_eulerian = np.empty((nt, nx, ny, nz))
-    # Create a 3D grid for interpolation using the Eulerian grid spacing
-    x = np.arange(domain.lower[1] + dx/2, domain.upper[1], dx)
-    y = np.arange(domain.lower[2] + dy/2, domain.upper[2], dy)
-    z = np.arange(domain.lower[3] + dz/2, domain.upper[3], dz)
-    grid_x, grid_y, grid_z = np.meshgrid(x, y, z, indexing='ij')
-    
+
+    # Create a 3D grid for interpolation
+    grid_x, grid_y, grid_z = np.mgrid[domain.lower[1]:domain.upper[1]:nx*1j, 
+                                      domain.lower[2]:domain.upper[2]:ny*1j, 
+                                      domain.lower[3]:domain.upper[3]:nz*1j]
+
     for time_slice_index in range(nt):
         # Flatten the trajectories and field arrays for interpolation
         tx_flat = tx[time_slice_index].flatten()
         ty_flat = ty[time_slice_index].flatten()
         tz_flat = tz[time_slice_index].flatten()
         c_flat = c_lagrange[time_slice_index].flatten()
-        
+
         # Perform the interpolation for each time slice
-        c_eulerian_slice = griddata((tx_flat, ty_flat, tz_flat), c_flat, (grid_x, grid_y, grid_z), method=method)
-        
+        c_eulerian_slice = griddata((tx_flat, ty_flat, tz_flat), c_flat, (grid_x, grid_y, grid_z), method='nearest')
+
         # Handle remaining NaNs in the result
         c_eulerian[time_slice_index] = np.nan_to_num(c_eulerian_slice, nan=0)
-    
+
     return c_eulerian
 
 
@@ -1574,12 +1247,12 @@ def save_image(u, path):
 
 def plot_and_save(data, path, cmap="gray"):
     plt.figure()  # Start a new figure
-    plt.imshow(data.T, cmap=cmap, origin='lower')  # Added origin='lower'
+    plt.imshow(data.T, cmap=cmap)
     plt.colorbar()
     plt.axis('off')
     plt.savefig(path, bbox_inches='tight', pad_inches=0)
     plt.close()  # Close the current figure
-    
+
 def get_data(filename, reorient=False):
     # Split the file name to get the extension
     _, file_extension = os.path.splitext(filename)
@@ -1666,8 +1339,8 @@ def parse_args():
                         action='store_true',
                         help="Flag to indicate if the full solution should be saved")
     
-    parser.add_argument('--Initial', action='store_true', help='Use initial guess', default=False)
-
+    parser.add_argument('--unet_w', type=float, help='Weight for UNet output', default=0.0)
+    
     parser.add_argument('--output_dir',
                     type=str,
                     required=True,
@@ -1681,14 +1354,14 @@ def parse_args():
     parser.set_defaults(dump_data=1)
     parser.set_defaults(multigrid=1)
     #parser.set_defaults(mg_interp='rollstack')
-    parser.set_defaults(plot_every=5000, report_every=1000, history_every=20000)
+    parser.set_defaults(plot_every=5000, report_every=1000, history_every=14999)
     parser.set_defaults(history_full=1)
     parser.set_defaults(optimizer='adamn')
     #parser.set_defaults(optimizer='lbfgs')
 
     parser.set_defaults(every_factor=1)
     parser.set_defaults(lr=0.001)
-    parser.set_defaults(frames=4)
+    parser.set_defaults(frames=5)
     return parser.parse_args()
 
 
@@ -1700,10 +1373,9 @@ def state_to_traj(domain, state, mod=np):
     tx, ty, tz = transform_txyz(tx, ty, tz, x, y, z, mod=mod)
     return tx, ty, tz
 
-def particles_to_field_3d_average(up, tx, ty, tz, domain):
-    return up
 
-def particles_to_field_3d_averageX(up, tx, ty, tz, domain):
+
+def particles_to_field_3d_average(up, tx, ty, tz, domain):
     dx = domain.step('x')
     dy = domain.step('y')
     dz = domain.step('z')
@@ -1748,10 +1420,8 @@ def particles_to_field_3d_averageX(up, tx, ty, tz, domain):
 
     return u_average
 
-def particles_to_field_3dX(up, tx, ty, tz, domain):
-    return up
 
-def particles_to_field_3dX(up, tx, ty, tz, domain):
+def particles_to_field_3d(up, tx, ty, tz, domain):
     '''
     up: values carried by particles, shape (nx, ny, nz)
     tx, ty, tz: trajectories of particles, shape (nx, ny, nz) as TensorFlow tensors
@@ -1888,7 +1558,7 @@ def particles_to_field(up, tx, ty, tz, domain):
     return u
 
 
-def particles_to_field_tfX(up, tx, ty, tz, domain):
+def particles_to_field_tf(up, tx, ty, tz, domain):
     '''
     up: values carried by particles, shape (nx, ny, nz)
     tx, ty, tz: trajectories of particles, shape (nt, nx, ny, nz) as TensorFlow tensors
@@ -2022,82 +1692,61 @@ def report_func(problem, state, epoch, cbinfo):
     
     tx, ty, tz = state_to_traj(domain, state, mod=np)
     tx, ty, tz = np.array(tx), np.array(ty), np.array(tz)
-    #c_lagrange = np.array(transform_c((domain.field(state, 'c')),tf))
-    #c_euler_last_slice = lagrange_to_euler_single_slice(c_lagrange, tx, ty, tz, domain, -1)
+    c_lagrange = np.array(transform_c((domain.field(state, 'c')),tf))
+    c_euler_last_slice = lagrange_to_euler_single_slice(c_lagrange, tx, ty, tz, domain, -1)
     
-    #edema_dice, core_dice = calculate_dice_scores(segm_data, coeff, c_euler_last_slice)
+    edema_dice, core_dice = calculate_dice_scores(segm_data, coeff, c_euler_last_slice)
     # Print current parameters.
     printlog('coeff={}'.format(coeff))
-    #printlog('dice={}'.format( [np.array(edema_dice), np.array(core_dice)]))
+    printlog('dice={}'.format( [np.array(edema_dice), np.array(core_dice)]))
 
 
 def history_func(problem, state, epoch, history, cbinfo):
     
     if args.save_full_solution and epoch > 0:
         process_and_save_solution(problem, state, wm_data, gm_data, csf_data, epoch)
-        
-def normalize_data(data):
-    """Normalizes the input data to be between 0 and 1."""
-    data_min = np.min(data)
-    data_max = np.max(data)
-    normalized_data = (data - data_min) / (data_max - data_min)
-    return normalized_data
 
-
-def process_and_save_solution(problem, state, wm_data, gm_data, csf_data, epoch, interpolation_method='nearest', save_interval=-1):
+def process_and_save_solution(problem, state, wm_data, gm_data, csf_data, epoch):
     domain = problem.domain
     mod = domain.mod
-    # Time slices
+
+    # Time slices.
     tx, ty, tz = state_to_traj(domain, state, mod=mod)
     tx, ty, tz = np.array(tx), np.array(ty), np.array(tz)
+
     # Initialize empty lists to store the data for each tissue type
     wm_results = []
     gm_results = []
     csf_results = []
+
     wm_mids = field_to_particles(wm_data, tx[-1], ty[-1], tz[-1], domain)
     wm_results = particles_to_field(wm_mids, tx, ty, tz, domain)
+
     gm_mids = field_to_particles(gm_data, tx[-1], ty[-1], tz[-1], domain)
     gm_results = particles_to_field(gm_mids, tx, ty, tz, domain)
+
     csf_mids = field_to_particles(csf_data, tx[-1], ty[-1], tz[-1], domain)
     csf_results = particles_to_field(csf_mids, tx, ty, tz, domain)
-    # Process c_p, c_n, and c_s fields
-    c_p_lagrange = np.array(transform_c(domain.field(state, 'c_p'), mod))
-    c_n_lagrange = np.array(transform_c(domain.field(state, 'c_n'), mod, repeat=True))
-    c_s_lagrange = np.array(transform_c(domain.field(state, 'c_s'), mod, initial_value=1, repeat=True))
-    c_p_euler = np.array(lagrange_to_euler_all_slices(c_p_lagrange, tx, ty, tz, domain, interpolation_method))
-    c_n_euler = np.array(lagrange_to_euler_all_slices(c_n_lagrange, tx, ty, tz, domain, interpolation_method))
-    c_s_euler = np.array(lagrange_to_euler_all_slices(c_s_lagrange, tx, ty, tz, domain, interpolation_method))
-    # Compute deformation tensor magnitude
-    dx, dy, dz = domain.step('x'), domain.step('y'), domain.step('z')
-    ux, uy, uz = compute_displacement_np(tx, ty, tz)
-    E = compute_strain_tensor_lagrangian_full_np(ux, uy, uz, dx, dy, dz)
-    magnitude = np.sqrt(E[0, 0]**2 + E[0, 1]**2 + E[0, 2]**2 +
-                        E[1, 0]**2 + E[1, 1]**2 + E[1, 2]**2 +
-                        E[2, 0]**2 + E[2, 1]**2 + E[2, 2]**2)
-    magnitude_euler = np.array(lagrange_to_euler_all_slices(magnitude, tx, ty, tz, domain, interpolation_method))
-    
-    data_dict = {
-        'wm_data': restore_all_timepoints(wm_results, save_interval),
-        'gm_data': restore_all_timepoints(gm_results, save_interval),
-        'csf_data': restore_all_timepoints(csf_results, save_interval),
-        'c_p_euler': restore_all_timepoints(c_p_euler, save_interval),
-        'c_n_euler': restore_all_timepoints(c_n_euler, save_interval),
-        'c_s_euler': restore_all_timepoints(c_s_euler, save_interval),
-        'tx': restore_all_timepoints(tx, save_interval),
-        'ty': restore_all_timepoints(ty, save_interval),
-        'tz': restore_all_timepoints(tz, save_interval),
-        'deformation_magnitude': restore_all_timepoints(magnitude_euler, save_interval)
-    }
-    filename = f'tissue_data4D_epoch{epoch}.npy'
-    with open(filename, 'wb') as f:
-        pickle.dump(data_dict, f, protocol=4)
-    print(f"Solution saved for epoch {epoch}.")
-    filename = f'tissue_data4D_epoch{epoch}.npy'
-    with open(filename, 'wb') as f:
-        pickle.dump(data_dict, f, protocol=4)
-    
-    print(f"Solution saved for epoch {epoch}.")
 
+    c_lagrange = np.array(transform_c(domain.field(state, 'c'), mod))
+    c_euler = np.array(lagrange_to_euler_all_slices(c_lagrange, tx, ty, tz, domain))
+
+    data_dict = {
+        'wm_data': restore_all_timepoints(wm_results,10), #save every 10nt
+        'gm_data': restore_all_timepoints(gm_results,10),
+        'csf_data': restore_all_timepoints(csf_results,10),
+        'c_euler': restore_all_timepoints(c_euler,10),
+        'tx': restore_all_timepoints(tx,10),
+        'ty': restore_all_timepoints(ty,10),
+        'tz': restore_all_timepoints(tz,10),
+        
+    }
+
+    filename = f'tissue_data4D_epoch{epoch}.npy'
+    with open(filename, 'wb') as f:
+        pickle.dump(data_dict, f, protocol=4)
+    
+    print(f"Solution saved for epoch {epoch}.")
 
 
 def plot(problem, state, epoch, frame, cbinfo=None):
@@ -2119,209 +1768,155 @@ def plot(problem, state, epoch, frame, cbinfo=None):
     tx, ty, tz = np.array(tx), np.array(ty), np.array(tz)
     wm_mids = field_to_particles(wm_data, tx[-1], ty[-1], tz[-1], domain)
     wm_intensities = particles_to_field(wm_mids, tx, ty, tz, domain)
-    wm_mirrored_3D = mirror_brain_tensor_np(wm_intensities[0],segm_data)
-    wm_mirrored_4D = particles_to_field(wm_mirrored_3D, tx, ty, tz, domain)
-
-    c_p_lagrange = np.array(transform_c(domain.field(state, 'c_p'), mod))
-    c_n_lagrange = np.array(transform_c(domain.field(state, 'c_n'), mod,repeat=True))
-    c_s_lagrange = np.array(transform_c(domain.field(state, 'c_s'), mod,initial_value=1,repeat=True))
-
-    CM_pos = center_of_mass(np.where(segm_data == 4, 1, 0))
+    c_lagrange = np.array(transform_c(domain.field(state, 'c'),mod))
+    # Select a middle slice for visualization
+    CM_pos = center_of_mass(np.where(segm_data == 4, 1,0))
     middle_z = int(CM_pos[2])
-    # Replace this fragment
-    fig, axes = plt.subplots(10, 7, figsize=(14, 20))  # Adjusted figure size for 10 rows
-
+    fig, axes = plt.subplots(7, 7, figsize=(14, 14))
     extent = [domain.lower[1], domain.upper[1], domain.lower[2], domain.upper[2]]
     timepoints = np.linspace(1, tx.shape[0] - 1, 6, dtype=int)
     timepoints = np.insert(timepoints, 0, 0)
 
-    x_min, y_min, x_max, y_max = domain.lower[1], domain.lower[2], domain.upper[1], domain.upper[2]
+    x_min = domain.lower[1]
+    y_min = domain.lower[2]
+    x_max = domain.upper[1]
+    y_max = domain.upper[2]
     
+    # Ensuring th_down is no less than 0.20 and no more than 0.35
+    th_down = tf.clip_by_value(domain.field(state, 'coeff')[5], clip_value_min=0.20, clip_value_max=0.35)
+
+    # Clip th_up values
+    # Ensuring th_up is no less than 0.50 and no more than 0.85
+    th_up = tf.clip_by_value(domain.field(state, 'coeff')[6], clip_value_min=0.50, clip_value_max=0.85)
+
+    # Calculate the strain tensor
     ux, uy, uz = compute_displacement_np(tx, ty, tz)
     E = compute_strain_tensor_lagrangian_full_np(ux, uy, uz, dx, dy, dz)
+    # Calculate the magnitude of the strain tensor at each time point
     magnitude = np.sqrt(E[0, 0]**2 + E[0, 1]**2 + E[0, 2]**2 + 
-                        E[1, 0]**2 + E[1, 1]**2 + E[1, 2]**2 +
-                        E[2, 0]**2 + E[2, 1]**2 + E[2, 2]**2)
-
+                    E[1, 0]**2 + E[1, 1]**2 + E[1, 2]**2 +
+                    E[2, 0]**2 + E[2, 1]**2 + E[2, 2]**2)
+    
     for i, t in enumerate(timepoints):
         axes[0, i].scatter(tx[t, :, :, middle_z].flatten(),
-                        ty[t, :, :, middle_z].flatten(),
-                        marker='o',
-                        edgecolor='none',
-                        facecolor='r',
-                        s=1.2,
-                        zorder=3,
-                        alpha=0.5)
+                           ty[t, :, :, middle_z].flatten(),
+                           marker='o',
+                           edgecolor='none',
+                           facecolor='r',
+                           s=1.2,
+                           zorder=3,
+                           alpha=0.5)
         axes[0, i].set_axis_off()
         axes[0, i].set_xlim([x_min, x_max])  # Set x limits
         axes[0, i].set_ylim([y_min, y_max])  # Set y limits
         axes[0, i].set_title('Trajectories t={:.2f}'.format(t * dt), fontsize=10)
 
         # Compute Eulerian representation for the current time slice
-        c_p_euler_slice = lagrange_to_euler_single_slice(c_p_lagrange, tx, ty, tz, domain, t)
-        c_n_euler_slice = lagrange_to_euler_single_slice(c_n_lagrange, tx, ty, tz, domain, t)
-        c_s_euler_slice = lagrange_to_euler_single_slice(c_s_lagrange, tx, ty, tz, domain, t)
+        c_euler_slice = lagrange_to_euler_single_slice(c_lagrange, tx, ty, tz, domain, t)
         magnitude_slice = lagrange_to_euler_single_slice(magnitude, tx, ty, tz, domain, t)
         vmin = np.min(magnitude_slice)
         vmax = np.max(magnitude_slice)
         
-        # Normalize the pet_data
-        normalized_pet_data = normalize_data(pet_data)
-
-        # Update the plotting code to use normalized_pet_data
-        axes[1, i].imshow(np.where(normalized_pet_data > 0, normalized_pet_data, np.nan)[:, :, middle_z].T,
-                        cmap='Reds',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal',
-                        vmin=0, vmax=1)
-        axes[1, i].set_title('pet_normalized', fontsize=10)
+        axes[1, i].imshow(np.where(pet_data > 0,1,np.nan)[:, :, middle_z].T,
+                          cmap='Reds',
+                          extent=extent,
+                          origin='lower',
+                          aspect='equal',
+                          vmin=0, vmax=1)
+        axes[1, i].set_title('pet', fontsize=10)
         axes[1, i].set_xlim([x_min, x_max])
         axes[1, i].set_ylim([y_min, y_max])
         axes[1, i].set_axis_off()
         
-        axes[2, i].imshow(np.where(get_enhancing_mask(segm_data), 1, np.nan)[:, :, middle_z].T,
-                        cmap='Reds',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal',
-                        vmin=0, vmax=1)
+        axes[2, i].imshow(np.where(get_core_mask(segm_data),1,np.nan)[:, :, middle_z].T,
+                          cmap='Reds',
+                          extent=extent,
+                          origin='lower',
+                          aspect='equal',
+                          vmin=0, vmax=1)
         axes[2, i].set_title('Seg', fontsize=10)
         axes[2, i].set_xlim([x_min, x_max])
         axes[2, i].set_ylim([y_min, y_max])
         axes[2, i].set_axis_off()
         
-        axes[2, i].imshow(np.where(get_edema_mask(segm_data), 1, np.nan)[:, :, middle_z].T,
-                        cmap='Greens',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal',
-                        vmin=0, vmax=1)
+        axes[2, i].imshow(np.where(get_edema_mask(segm_data),1,np.nan)[:, :, middle_z].T,
+                          cmap='Greens',
+                          extent=extent,
+                          origin='lower',
+                          aspect='equal',
+                          vmin=0, vmax=1)
         axes[2, i].set_xlim([x_min, x_max])  
         axes[2, i].set_ylim([y_min, y_max])
         axes[2, i].set_axis_off()
         
-        axes[2, i].imshow(np.where(get_necrotic_mask(segm_data), 1, np.nan)[:, :, middle_z].T,
-                        cmap='Oranges',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal',
-                        vmin=0, vmax=1)
-        axes[2, i].set_xlim([x_min, x_max])  
-        axes[2, i].set_ylim([y_min, y_max])
-        axes[2, i].set_axis_off()
-        
-        axes[3, i].imshow(np.where(c_p_euler_slice[:, :, middle_z] > th_enhancing_ch, 1, np.nan).T,
-                        cmap='Reds',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal',
-                        vmin=0, vmax=1)
+        axes[3, i].imshow(np.where(c_euler_slice[:, :, middle_z] > th_up,1,np.nan).T,
+                          cmap='Reds',
+                          extent=extent,
+                          origin='lower',
+                          aspect='equal',
+                          vmin=0, vmax=1)
         axes[3, i].set_title('Proposed seg', fontsize=10)
         axes[3, i].set_xlim([x_min, x_max])
         axes[3, i].set_ylim([y_min, y_max])
         axes[3, i].set_axis_off()
         
-        axes[3, i].imshow(np.where(np.logical_and(c_p_euler_slice[:, :, middle_z] < th_enhancing_ch, c_p_euler_slice[:, :, middle_z] > th_edema_ch), 1, np.nan).T,
-                        cmap='Greens',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal',
-                        vmin=0, vmax=1)
+        axes[3, i].imshow(np.where(np.logical_and(c_euler_slice[:, :, middle_z] < th_up, c_euler_slice[:, :, middle_z] > th_down),1,np.nan).T,
+                          cmap='Greens',
+                          extent=extent,
+                          origin='lower',
+                          aspect='equal',
+                          vmin=0, vmax=1)
         axes[3, i].set_xlim([x_min, x_max])  
         axes[3, i].set_ylim([y_min, y_max])
         axes[3, i].set_axis_off()
         
-        axes[3, i].imshow(np.where(c_n_euler_slice[:, :, middle_z] > th_necro_ch, 1, np.nan).T,
-                        cmap='Oranges',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal',
-                        vmin=0, vmax=1)
-        axes[3, i].set_title('Proposed seg', fontsize=10)
-        axes[3, i].set_xlim([x_min, x_max])
-        axes[3, i].set_ylim([y_min, y_max])
-        axes[3, i].set_axis_off()
 
-        axes[4, i].imshow(c_p_euler_slice[:, :, middle_z].T,
-                        interpolation='nearest',
-                        cmap='gray',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal',
-                        vmin=0, vmax=1)
-        axes[4, i].set_title('Proliferative (c_p)', fontsize=10)
+        
+        axes[4, i].imshow(c_euler_slice[:, :, middle_z].T,
+                          interpolation='nearest',
+                          cmap='gray',
+                          extent=extent,
+                          origin='lower',
+                          aspect='equal',
+                          vmin=0, vmax=1)
+        axes[4, i].set_title('C Field', fontsize=10)
         axes[4, i].set_xlim([x_min, x_max])  # Set x limits
         axes[4, i].set_ylim([y_min, y_max])  # Set y limits
         axes[4, i].set_axis_off()
-
-        axes[5, i].imshow(c_n_euler_slice[:, :, middle_z].T,
-                        interpolation='nearest',
-                        cmap='gray',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal',
-                        vmin=0, vmax=1)
-        axes[5, i].set_title('Necrotic (c_n)', fontsize=10)
+        
+        # Add the white matter intensity plot
+        wm_im = axes[5, i].imshow(wm_intensities[t, :, :, middle_z].T,
+                                interpolation='nearest',
+                                cmap='gray',  # or choose another colormap that suits your data
+                                extent=extent,
+                                origin='lower',
+                                aspect='equal')
+        axes[5, i].set_title('WHITE MATTER', fontsize=10)
         axes[5, i].set_xlim([x_min, x_max])  # Set x limits
         axes[5, i].set_ylim([y_min, y_max])  # Set y limits
         axes[5, i].set_axis_off()
-
-        axes[6, i].imshow(c_s_euler_slice[:, :, middle_z].T,
-                        interpolation='nearest',
-                        cmap='gray',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal',
-                        vmin=0, vmax=1)
-        axes[6, i].set_title('Nutrient (c_s)', fontsize=10)
-        axes[6, i].set_xlim([x_min, x_max])  # Set x limits
-        axes[6, i].set_ylim([y_min, y_max])  # Set y limits
-        axes[6, i].set_axis_off()
-        
-        # Add the white matter intensity plot
-        axes[7, i].imshow(wm_intensities[t, :, :, middle_z].T,
-                        interpolation='nearest',
-                        cmap='gray',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal')
-        axes[7, i].set_title('WHITE MATTER', fontsize=10)
-        axes[7, i].set_xlim([x_min, x_max])  # Set x limits
-        axes[7, i].set_ylim([y_min, y_max])  # Set y limits
-        axes[7, i].set_axis_off()
-        
-        # Add the mirrored tissue plot
-        axes[8, i].imshow(wm_mirrored_4D[t, :, :, middle_z].T,
-                        interpolation='nearest',
-                        cmap='gray',
-                        extent=extent,
-                        origin='lower',
-                        aspect='equal')
-        axes[8, i].set_title('MIRRORED TISSUE', fontsize=10)
-        axes[8, i].set_xlim([x_min, x_max])  # Set x limits
-        axes[8, i].set_ylim([y_min, y_max])  # Set y limits
-        axes[8, i].set_axis_off()
-
+    
         # Display the magnitude of the strain tensor
-        axes[9, i].imshow(magnitude_slice[:, :, middle_z].T,
+        axes[6, i].imshow(magnitude_slice[:, :, middle_z].T,
                         interpolation='nearest',
                         cmap='Greys',
                         extent=extent,
                         origin='lower',
-                        vmin=vmin, vmax=vmax)
+                        vmin=vmin, vmax=vmax)  # use vmin and vmax here
+        # Determine the order of magnitude of the min and max magnitudes
         log_max = np.log10(np.max(magnitude[t, :, :]))
-        axes[9, i].text(x_min, y_max, "Max: ~10^{:.1f}".format(log_max), fontsize=15, color='red', ha='left', va='top')
-        axes[9, i].set_axis_off()
-        axes[9, i].set_xlim([x_min, x_max])  # Set x limits
-        axes[9, i].set_ylim([y_min, y_max])  # Set y limits
-        axes[9, i].set_axis_off()
+        # Display these as text on the plot
+        axes[6, i].text(x_min, y_max, "Max: ~10^{:.1f}".format(log_max), fontsize=15, color='red', ha='left', va='top')
+        axes[6, i].set_axis_off()
+        axes[6, i].set_xlim([x_min, x_max])  # Set x limits
+        axes[6, i].set_ylim([y_min, y_max])  # Set y limits
+        axes[6, i].set_axis_off()
+
 
     fig.subplots_adjust(hspace=0.005, wspace=0.005)
     fig.tight_layout()
     plt.savefig(path, pad_inches=0.01, transparent=False, dpi=300)
     return 0
-
 
 def plot_final(problem, state):
     pass
@@ -2451,6 +2046,7 @@ def process_data(args, matter_th):
     print("Combined data range after zooming and CSF adjustment:", combined_data.min(), combined_data.max())
 
     outside_skull_mask = (combined_data < matter_th).astype(int)
+    outside_skull_mask = correct_outside_skull_mask(outside_skull_mask)
     print("Outside skull mask unique values:", np.unique(outside_skull_mask))
     print(f"Number of voxels outside skull: {np.sum(outside_skull_mask)}")
 
@@ -2501,6 +2097,7 @@ def process_data(args, matter_th):
 
     return wm_data, gm_data, csf_data, segm_data, pet_data, outside_skull_mask, CM_pos
 
+
 def restore(wm_data):
     global crop_bounds, zoom_factors, original_shape
     # Use the global variables to restore the data
@@ -2515,131 +2112,29 @@ def restore(wm_data):
 
     return restored_data
 
-def restore_all_timepoints(data_4D, n=-1):
+def restore_all_timepoints(data_4D, n):
     global crop_bounds, zoom_factors, original_shape
     num_timepoints = data_4D.shape[0]
     
-    if n == -1:
-        indices_to_process = [0, num_timepoints - 1]
-    else:
-        # Determine which timepoints to process
-        indices_to_process = set(range(0, num_timepoints, n))  # Every nth timepoint
-        indices_to_process.add(0)  # Ensure the first timepoint is included
-        indices_to_process.add(num_timepoints - 1)  # Ensure the last timepoint is included
-        indices_to_process = sorted(indices_to_process)  # Sort the indices
+    # Determine which timepoints to process
+    indices_to_process = set(range(0, num_timepoints, n))  # Every nth timepoint
+    indices_to_process.add(0)  # Ensure the first timepoint is included
+    indices_to_process.add(num_timepoints - 1)  # Ensure the last timepoint is included
+    indices_to_process = sorted(indices_to_process)  # Sort the indices
     
     # Initialize an empty 4D array with a size based on the number of timepoints to process
     restored_data_4D = np.zeros((len(indices_to_process),) + original_shape, dtype=data_4D.dtype)
     
     for i, t in enumerate(indices_to_process):
-        # Apply the restore function to each selected time slice
+        # Apply the `restore` function to each selected time slice
         restored_data_4D[i] = restore(data_4D[t])
-    
+
     return restored_data_4D
 
 
-def dice_score(pred, true):
-    intersection = np.sum(pred & true)
-    return (2. * intersection) / (np.sum(pred) + np.sum(true))
-
-def evaluate_guess_quality(P_ts, N_ts, S_ts, verbose=True):
-    # Get masks
-    edema_mask = get_edema_mask(segm_data)
-    enhancing_mask = get_enhancing_mask(segm_data)
-    necrotic_mask = get_necrotic_mask(segm_data)
-    tumor_mask = (segm_data > 0)
-
-    # Calculate dice scores
-    dice_enhancing = dice_score(P_ts[-1] > th_enhancing_ch, enhancing_mask)
-    dice_edema = dice_score(P_ts[-1] > th_edema_ch, edema_mask)
-    dice_necrotic = dice_score(N_ts[-1] > th_necro_ch, necrotic_mask)
-
-    # Calculate PET correlation
-    pet_correlation, _ = pearsonr(pet_data[tumor_mask].flatten(), P_ts[-1][tumor_mask].flatten())
-
-    # Calculate total score (you may want to adjust the weights)
-    total_score = dice_enhancing + dice_edema + dice_necrotic + pet_correlation
-
-    if verbose:
-        print(f"Dice score (Enhancing): {dice_enhancing:.4f}")
-        print(f"Dice score (Edema): {dice_edema:.4f}")
-        print(f"Dice score (Necrotic): {dice_necrotic:.4f}")
-        print(f"PET correlation: {pet_correlation:.4f}")
-        print(f"Total score: {total_score:.4f}")
-
-    return total_score
-
-def calculate_initial_guess(CM_pos, nx, ny, nz, init_scale_value, dx, dy, dz, nt,
-    max_stopping_time
-):
-    global D_ch, rho_ch, D_s_ch
-    
-    best_score = -np.inf
-    best_guess = None
-    winning_percentage = 1.0
-
-    for percentage in [0.1, 0.2, 0.4, 0.6, 0.8, 1.0]:
-        stopping_time = percentage * max_stopping_time
-        
-        parameters = {
-            'Dw': D_ch,
-            'rho': rho_ch,
-            'lambda_np': lambda_np_ch,
-            'sigma_np': sigma_np_ch,
-            'D_s': D_s_ch,
-            'lambda_s': lambda_s_ch,
-            'RatioDw_Dg': R_ch,
-            'Nt_multiplier': 8,
-            'gm': gm_data,
-            'wm': wm_data,
-            'NxT1_pct': CM_pos[0]/nx,
-            'NyT1_pct': CM_pos[1]/ny,
-            'NzT1_pct': CM_pos[2]/nz,
-            'init_scale': init_scale_value,
-            'resolution_factor': 1,
-            'th_matter': 0.1,
-            'verbose': True,
-            'time_series_solution_Nt': nt - 1,
-            'dx_mm': dx,
-            'dy_mm': dy,
-            'dz_mm': dz,
-            'stopping_time': stopping_time
-        }
-
-        start_time = time.time()
-        fk_solver = Solver(parameters)
-        result = fk_solver.solve()
-        end_time = time.time()
-        execution_time = int(end_time - start_time)
-        print(f"Execution time for {percentage*100}% stopping time: {execution_time} seconds")
-
-        time_series = result['time_series']
-        P_ts = np.array(time_series['P'])
-        N_ts = np.array(time_series['N'])
-        S_ts = np.array(time_series['S'])
-
-        score = evaluate_guess_quality(P_ts, N_ts, S_ts, verbose=True)
-
-        if score > best_score:
-            best_score = score
-            best_guess = (P_ts, N_ts, S_ts)
-            winning_percentage = percentage
-
-    # Update global parameters based on the winning percentage
-    D_ch *= winning_percentage
-    rho_ch *= winning_percentage
-    D_s_ch *= winning_percentage
-
-    print(f"Winning percentage: {winning_percentage*100}%")
-    print(f"Updated D_ch: {D_ch}")
-    print(f"Updated rho_ch: {rho_ch}")
-    print(f"Updated D_s_ch: {D_s_ch}")
-
-    return best_guess
-
 
 def make_problem(args):
-    global wm_data, gm_data, csf_data, outside_skull_mask, segm_data,pet_data, dtype, CM_pos, matter_th, TS, gamma_ch, init_scale_value
+    global wm_data, gm_data, csf_data, outside_skull_mask, segm_data,pet_data, dtype, CM_pos, matter_th, TS, gamma_ch
     wm_data, gm_data, csf_data, segm_data, pet_data, outside_skull_mask, CM_pos = process_data(args, matter_th)
 
     dtype = np.float32
@@ -2651,7 +2146,8 @@ def make_problem(args):
                          multigrid=args.multigrid,
                          mg_interp=args.mg_interp,
                          mg_nlvl=args.nlvl)
-                         #mg_convert_all=False)
+
+
 
 
     if domain.multigrid:
@@ -2667,8 +2163,7 @@ def make_problem(args):
     y2 = yy[0]
     z2 = zz[0]
     op = partial(operator_adv)
-    tracers = {'epoch': tf.Variable(0, dtype=domain.dtype)}
-    problem = odil.Problem(op, domain, tracers=tracers)
+    problem = odil.Problem(op, domain)
 
 
     
@@ -2680,48 +2175,50 @@ def make_problem(args):
     dy = domain.step('y')
     dz = domain.step('z')
     
-    init_scale_value = calculate_init_scale(xx)
-
-    P_ts, N_ts, S_ts = calculate_initial_guess(
-            CM_pos, nx, ny, nz, init_scale_value, dx, dy, dz, nt,
-            max_stopping_time)
-
-    # Check if initial guess is provided
-    if args.Initial:
-        # Prepend the initial zero state to the time series data
-        initial_zero_state = np.zeros_like(P_ts[0], dtype=dtype)
-        P_ts = np.insert(P_ts, 0, initial_zero_state, axis=0)
-        N_ts = np.insert(N_ts, 0, initial_zero_state, axis=0)
-        S_ts = np.insert(S_ts, 0, initial_zero_state, axis=0)
-    else:
-        P_ts = N_ts = S_ts = np.zeros((P_ts.shape[0] + 1, *P_ts.shape[1:]), dtype=dtype)
-    TS = {'P': P_ts, 'N': N_ts, 'S': S_ts}
+    parameters = {
+    'Dw': D_ch,         # Diffusion coefficient for white matter
+    'rho': rho_ch,        # Proliferation rate
+    'RatioDw_Dg': R_ch,  # Ratio of diffusion coefficients in white and grey matter
+    'gm': gm_data,      # Grey matter data
+    'wm': wm_data,      # White matter data
+    'NxT1_pct': CM_pos[0]/nx,    # initial focal position (in percentages)
+    'NyT1_pct': CM_pos[1]/ny,
+    'NzT1_pct': CM_pos[2]/nz,
+    'resolution_factor': 1,
+    'time_series_solution_Nt': nt-1,
+    'dx_mm': dx,
+    'dy_mm': dy,
+    'dz_mm': dz,
+    'init_scale': 0.8
+    }
+    result = solver(parameters)
+    FK_ts = np.array(result['time_series']).astype(dtype)
     
-    # Initial state
+    # Create an array of zeros with the same shape as one time step
+    initial_zero_state = np.zeros(FK_ts[0].shape)
+    # Prepend the initial zero state to the time series data
+    FK_ts = np.vstack([initial_zero_state[np.newaxis, ...], FK_ts])
+
+    # Initial state.
     state = odil.State(
         fields={
-            'coeff': odil.Array([D_ch, rho_ch, int(CM_pos[0]), int(CM_pos[1]), int(CM_pos[2]), th_edema_ch, th_enhancing_ch, th_necro_ch, lambda_s_ch, R_ch, D_s_ch, gamma_ch,lambda_np_ch, sigma_np_ch]), #int(CM_pos) because the forward solver has it
+            'coeff': odil.Array([D_ch, rho_ch,CM_pos[0],CM_pos[1],CM_pos[2],th_down_s,th_up_s, gamma_ch]),
+            # Initial trajectory.
             'x': odil.Field(domain.points('x'), loc='cccc'),
             'y': odil.Field(domain.points('y'), loc='cccc'),
             'z': odil.Field(domain.points('z'), loc='cccc'),
-            'c_p': odil.Field(P_ts, loc='cccc'),
-            'c_n': odil.Field(N_ts, loc='cccc'),
-            'c_s': odil.Field(S_ts, loc='cccc')
+            'c': odil.Field(FK_ts, loc='cccc')
         })
-    
     state = domain.init_state(state)
-    #if mg_nlvl > 1:
-    #    excluded_keys = {'x', 'y', 'z', 'coeff'}
-    #    for key in state.fields:
-    #        if key not in excluded_keys:
-    #            state.fields[key] = domain.regular_to_multigrid(state.fields[key])
+    TS = FK_ts
     return problem, state
 
 
 def main():
-    global problem, args, wm_data, gm_data, csf_data, outside_skull_mask, pet_w
+    global problem, args, wm_data, gm_data, csf_data, outside_skull_mask, unet_w, pet_w
 
     args = parse_args()
+    unet_w = args.unet_w #read unet_w
     default_outdir = args.output_dir
     setattr(args, 'outdir', default_outdir)   
     odil.setup_outdir(args,[])
@@ -2756,34 +2253,18 @@ def main():
         csf_mids = field_to_particles(csf_data, tx[-1], ty[-1], tz[-1], domain)
         csf_results = particles_to_field(csf_mids, tx, ty, tz, domain)
 
-        c_p_lagrange = np.array(transform_c(domain.field(state, 'c_p'),mod))
-        c_p_euler = np.array(lagrange_to_euler_all_slices(c_p_lagrange, tx, ty, tz, domain,'nearest'))
-        
-        c_n_lagrange = np.array(transform_c(domain.field(state, 'c_n'),mod,repeat=True))
-        c_n_euler = np.array(lagrange_to_euler_all_slices(c_n_lagrange, tx, ty, tz, domain,'nearest'))
-        
-        c_s_lagrange = np.array(transform_c(domain.field(state, 'c_s'),mod,initial_value=1,repeat=True))
-        c_s_euler = np.array(lagrange_to_euler_all_slices(c_s_lagrange, tx, ty, tz, domain,'nearest'))
+        c_lagrange = np.array(transform_c(domain.field(state, 'c'),mod))
+        c_euler = np.array(lagrange_to_euler_all_slices(c_lagrange, tx, ty, tz, domain))
 
-        # Compute deformation tensor magnitude
-        dx, dy, dz = domain.step('x'), domain.step('y'), domain.step('z')
-        ux, uy, uz = compute_displacement_np(tx, ty, tz)
-        E = compute_strain_tensor_lagrangian_full_np(ux, uy, uz, dx, dy, dz)
-        magnitude = np.sqrt(E[0, 0]**2 + E[0, 1]**2 + E[0, 2]**2 +
-                            E[1, 0]**2 + E[1, 1]**2 + E[1, 2]**2 +
-                            E[2, 0]**2 + E[2, 1]**2 + E[2, 2]**2)
-        magnitude_euler = np.array(lagrange_to_euler_all_slices(magnitude, tx, ty, tz, domain,'nearest'))
-        
         data_dict = {
             'wm_data': wm_results,
             'gm_data': gm_results,
             'csf_data': csf_results,
-            'c_p_euler': c_p_euler,
-            'c_n_euler': c_n_euler,
-            'c_s_euler': c_s_euler,
-            'deformation_magnitude': magnitude_euler
+            'c_euler': c_euler
         }
+
         np.save('tissue_data4D.npy', data_dict)
+        
         print("Solution saved for the given time point.")
     else:
         print("Not saving solution as the flag is not set.")
