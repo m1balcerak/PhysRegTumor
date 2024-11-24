@@ -87,7 +87,7 @@ data_dict = {
 The dictionary is saved as a NumPy file named:  
 `tissue_data4D_epoch{epoch}.npy`
 
-The results are stored in the same resolution as the input data, ensuring compatibility for further analysis. Takes around 3h on RTX 6000 per patient.
+The results are stored in the same resolution as the input data, ensuring compatibility for further analysis. Takes around 3h on RTX 6000 per patient. 22 GB of memory required. 
 
 
 ## Data
