@@ -70,6 +70,4 @@ This framework requires a dataset to work with. The dataset used in this project
 
 [GliODIL Dataset on Hugging Face](https://huggingface.co/datasets/m1balcerak/GliODIL)
 
-Ensure you download and properly configure the dataset before running the script.
-
 ---
