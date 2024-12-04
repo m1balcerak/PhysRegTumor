@@ -22,13 +22,6 @@ To install the dependencies, run the following command (with python 3.11.2):
 pip install -r requirements_PhysRegTumor.txt
 ```
 
-Alternatively, if you prefer using `conda`:
-
-```bash
-conda create --name physregtumor --file requirements_PhysRegTumor.txt
-conda activate physregtumor
-```
-
 ---
 
 ## Running the Code
