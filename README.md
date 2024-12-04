@@ -16,7 +16,7 @@ If you want an easy jupyternotebook with synthetic data playground go to: https:
 
 To run this project, make sure you have the necessary dependencies installed. You can use the provided `requirements_PhysRegTumor.txt` file to install all required packages.
 
-To install the dependencies, run the following command:
+To install the dependencies, run the following command (with python 3.11.2):
 
 ```bash
 pip install -r requirements_PhysRegTumor.txt
