@@ -88,7 +88,7 @@ The results are stored in the same resolution as the input data, ensuring compat
 
 ## Data
 
-This framework requires a dataset to work with. The dataset used in this project can be found at the following link:
+The dataset used in this project can be found at the following link. We included only those patients (n=58) who had existing FET.nii.gz files, corresponding to the FET-PET modality.
 
 [GliODIL Dataset](https://huggingface.co/datasets/m1balcerak/GliODIL)
 
