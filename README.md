@@ -1,7 +1,6 @@
 # PhysRegTumor
 **Physics-Regularized Multi-Modal Image Assimilation for Brain Tumor Localization**  
 (NeurIPS 2024)  
-**UNDER CONSTRUCTION v.01**
 
 If you have any suggestions or encounter difficulties, feel free to reach out via email at:  
 [email_michal](mailto:michal.balcerak@uzh.ch)
@@ -17,17 +16,10 @@ If you want an easy jupyternotebook with synthetic data playground go to: https:
 
 To run this project, make sure you have the necessary dependencies installed. You can use the provided `requirements_PhysRegTumor.txt` file to install all required packages.
 
-To install the dependencies, run the following command:
+To install the dependencies, run the following command (with python 3.11.2):
 
 ```bash
 pip install -r requirements_PhysRegTumor.txt
-```
-
-Alternatively, if you prefer using `conda`:
-
-```bash
-conda create --name physregtumor --file requirements_PhysRegTumor.txt
-conda activate physregtumor
 ```
 
 ---
@@ -96,7 +88,7 @@ The results are stored in the same resolution as the input data, ensuring compat
 
 ## Data
 
-This framework requires a dataset to work with. The dataset used in this project can be found at the following link:
+The dataset used in this project can be found at the following link. We included only those patients (n=58) who had existing FET.nii.gz files, corresponding to the FET-PET modality.
 
 [GliODIL Dataset](https://huggingface.co/datasets/m1balcerak/GliODIL)
 
