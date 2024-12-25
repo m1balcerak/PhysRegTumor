@@ -23,6 +23,7 @@ printlog = odil.util.printlog
 
 # Data tensors
 global wm_data, gm_data, csf_data, segm_data, pet_data
+global stored_affine
 
 # Material properties
 global dtype, gamma, gamma_ch
@@ -36,7 +37,7 @@ BC_w = 850
 pde_w = 60000
 balance_w = 215
 neg_w = 80
-core_w = 13.5
+core_w = 17.5
 edema_w = 13.5
 outside_w = 13.5
 params_w = 98
@@ -45,7 +46,7 @@ symmetry_w = 3.2
 # Diffusion and reaction parameters
 global D_ch, R_ch, rho_ch, matter_th
 D_ch = 0.13
-R_ch = 21
+R_ch = 10
 rho_ch = 0.06
 matter_th = 0.1
 
@@ -57,16 +58,13 @@ th_up_s = 0.62
 # Control points and tissue segmentation weights
 global CM_pos
 
-# UNet model weight
-global unet_w
-
 global pet_w
 pet_w = 1.0
 
 # Regularization factors for spatial and temporal components
 global TS, kxreg, ktreg
-kxreg = 10
-ktreg = 75
+kxreg = 11
+ktreg = 80
 
 def gauss_sol3d_tf(x, y, z, dx, dy, dz, init_scale):
     # Experimentally chosen
@@ -804,14 +802,8 @@ def operator_adv(ctx):
 
     
     # normalize the loss constructed so far 
-    kappa = 3.0 # expected average value of res
-    # Divide each element in the list by kappa and multiply by (1-unet_w)
-    res = [x / kappa * (1-unet_w) for x in res]
-    
-
-    # add nnUnet loss 
-    #if unet_w > 0:
-    #    res += [unet_loss(unet_data, c_euler,th_down)*unet_w]
+    kappa = 3.0 
+    res = [x / kappa  for x in res]
     
     # PET loss
     res += [pet_loss(pet_data, segm_data, c_euler)*pet_w]
@@ -1135,7 +1127,7 @@ def initialize_c(nx, ny, nz, x_center, y_center, z_center, radius):
     return c_init.astype(dtype)
 
 
-def lagrange_to_euler_single_slice(c_lagrange, tx, ty, tz, domain, time_slice_index):
+def lagrange_to_euler_single_slice(c_lagrange, tx, ty, tz, domain, time_slice_index, method='nearest'):
     nx = domain.size('x')
     ny = domain.size('y')
     nz = domain.size('z')
@@ -1155,7 +1147,7 @@ def lagrange_to_euler_single_slice(c_lagrange, tx, ty, tz, domain, time_slice_in
                                       domain.lower[3]:domain.upper[3]:nz*1j]
     
     # Perform the interpolation for the specified time slice
-    c_eulerian_slice = griddata((tx_flat, ty_flat, tz_flat), c_flat, (grid_x, grid_y, grid_z), method='nearest')
+    c_eulerian_slice = griddata((tx_flat, ty_flat, tz_flat), c_flat, (grid_x, grid_y, grid_z), method=method)
 
     # Handle remaining NaNs in the result
     c_eulerian_slice = np.nan_to_num(c_eulerian_slice, nan=0)
@@ -1253,7 +1245,13 @@ def plot_and_save(data, path, cmap="gray"):
     plt.savefig(path, bbox_inches='tight', pad_inches=0)
     plt.close()  # Close the current figure
 
-def get_data(filename, reorient=False):
+def get_data(filename):
+    """
+    Load a 3D volume from either a .npy or .nii(.gz) file.
+    Also store the orientation/affine in a global variable if the file is NIfTI.
+    """
+    global stored_affine
+    
     # Split the file name to get the extension
     _, file_extension = os.path.splitext(filename)
 
@@ -1264,17 +1262,15 @@ def get_data(filename, reorient=False):
     # Load data based on file extension
     if file_extension == '.npy':
         volume = np.load(filename)
+        # No orientation info to store for NPY
+        stored_affine = None
+
     elif file_extension == '.nii':
         nii_img = nib.load(filename)
         volume = nii_img.get_fdata()
 
-        # Check if reorientation is required
-        if reorient:
-            # Assuming you want to reorient to the identity matrix
-            affine = np.eye(4)
-            volume = nib.Nifti1Image(volume, affine)
-            # Re-load the data from the newly affine-set image
-            volume = volume.get_fdata()
+        # Store affine in the global variable
+        stored_affine = nii_img.affine
 
     else:
         raise ValueError(f"Unsupported file extension: {file_extension}")
@@ -1339,8 +1335,10 @@ def parse_args():
                         action='store_true',
                         help="Flag to indicate if the full solution should be saved")
     
-    parser.add_argument('--unet_w', type=float, help='Weight for UNet output', default=0.0)
-    
+    parser.add_argument('--save_last_timestep_solution',
+                    action='store_true',
+                    help="Flag to indicate if the last timestep solution should be saved")
+        
     parser.add_argument('--output_dir',
                     type=str,
                     required=True,
@@ -2216,10 +2214,9 @@ def make_problem(args):
 
 
 def main():
-    global problem, args, wm_data, gm_data, csf_data, outside_skull_mask, unet_w, pet_w
+    global problem, args, wm_data, gm_data, csf_data, outside_skull_mask, pet_w
 
     args = parse_args()
-    unet_w = args.unet_w #read unet_w
     default_outdir = args.output_dir
     setattr(args, 'outdir', default_outdir)   
     odil.setup_outdir(args,[])
@@ -2242,31 +2239,31 @@ def main():
     gm_results = []
     csf_results = []
 
-    if args.save_full_solution:
+    if args.save_last_timestep_solution:
         print("Computing and saving solution for the given time point...")
+        # Compute Euler form of 'c'
+        c_lagrange = np.array(transform_c(domain.field(state, 'c'), mod))
+        c_euler_last_slice = lagrange_to_euler_single_slice(c_lagrange, tx, ty, tz, domain, -1)
 
-        wm_mids = field_to_particles(wm_data, tx[-1], ty[-1], tz[-1], domain)
-        wm_results = particles_to_field(wm_mids, tx, ty, tz, domain)
+        # Restore final step arrays
+        c_euler_restored = restore(c_euler_last_slice)
+        
+        # **Add this single line to invert the X and Y axes: **
+        c_euler_restored = c_euler_restored[::-1, ::-1, :]
 
-        gm_mids = field_to_particles(gm_data, tx[-1], ty[-1], tz[-1], domain)
-        gm_results = particles_to_field(gm_mids, tx, ty, tz, domain)
- 
-        csf_mids = field_to_particles(csf_data, tx[-1], ty[-1], tz[-1], domain)
-        csf_results = particles_to_field(csf_mids, tx, ty, tz, domain)
-
-        c_lagrange = np.array(transform_c(domain.field(state, 'c'),mod))
-        c_euler = np.array(lagrange_to_euler_all_slices(c_lagrange, tx, ty, tz, domain))
-
+        # Save data
         data_dict = {
-            'wm_data': wm_results,
-            'gm_data': gm_results,
-            'csf_data': csf_results,
-            'c_euler': c_euler
+            'c_euler': c_euler_restored
         }
 
-        np.save('tissue_data4D.npy', data_dict)
-        
-        print("Solution saved for the given time point.")
+        # Create a nibabel NIfTI image
+        c_euler_nifti = nib.Nifti1Image(c_euler_restored, stored_affine)
+
+        # Save
+        nifti_filename = 'c_euler_last_timestep.nii'
+        nib.save(c_euler_nifti, nifti_filename)
+        print(f"NIfTI file saved as {nifti_filename}")
+
     else:
         print("Not saving solution as the flag is not set.")
 
