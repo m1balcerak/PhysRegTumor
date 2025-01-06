@@ -66,24 +66,9 @@ To run the project, follow these steps:
 
 ## Output
 
-The output of the framework includes a dictionary with the following structure:
+The output of the framework is a nifty file named 'c_euler_last_timestep.nii' with the tumor cell 3D concentraion map.
 
-```python
-data_dict = {
-    'wm_data',   # White matter (coordinates: t, x, y, z)
-    'gm_data',   # Gray matter (coordinates: t, x, y, z)
-    'csf_data',  # Cerebrospinal fluid (coordinates: t, x, y, z)
-    'c_euler',   # Tumor cells (Euler projection, coordinates: t, x, y, z)
-    'tx',        # x-positions of particles (particle index: t, x, y, z)
-    'ty',        # y-positions of particles (particle index: t, x, y, z)
-    'tz',        # z-positions of particles (particle index: t, x, y, z)
-}
-```
-
-The dictionary is saved as a NumPy file named:  
-`tissue_data4D_epoch{epoch}.npy`
-
-The results are stored in the same resolution as the input data, ensuring compatibility for further analysis. Takes around 3h on RTX 6000 per patient. 22 GB of memory required. 
+The results are stored in the same resolution as the input data, ensuring compatibility for further analysis. Takes around 4h on RTX 6000 per patient. 38 GB of memory required. 
 
 
 ## Data
