@@ -20,12 +20,12 @@ run_instance() {
 
     OUT_FILE_PATH=$ver
 
-    python PhysRegTumor.py --Nx 72 --Ny 72 --Nz 72 --Nt 96 \
-    --nlvl $nlvl --save_full_solution \
+    python PhysRegTumor.py --Nx 72 --Ny 72 --Nz 72 --Nt 128 \
+    --nlvl $nlvl --save_last_timestep_solution \
     --wmfile $WM_FILE_PATH --gmfile $GM_FILE_PATH --csffile $CSF_FILE_PATH --segmfile $SEGM_FILE_PATH \
     --output_dir $OUT_FILE_PATH --petfile $PET_FILE_PATH
 }
 
 # Run N instances in parallel
-run_instance 0 001 4 &
+run_instance 0 001 3 &
 
