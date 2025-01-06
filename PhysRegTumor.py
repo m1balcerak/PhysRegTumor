@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 import pickle
 import matplotlib
@@ -1748,7 +1749,7 @@ def process_and_save_solution(problem, state, wm_data, gm_data, csf_data, epoch)
 
 
 def plot(problem, state, epoch, frame, cbinfo=None):
-    global wm_data, gm_data, csf_data, outside_skull_mask, segm_data
+    global wm_data, gm_data, csf_data, outside_skull_mask, segm_data, CM_pos
     domain = problem.domain
     mod = domain.mod
     path = f"{frame}_cmp_3d"
@@ -1767,8 +1768,15 @@ def plot(problem, state, epoch, frame, cbinfo=None):
     wm_mids = field_to_particles(wm_data, tx[-1], ty[-1], tz[-1], domain)
     wm_intensities = particles_to_field(wm_mids, tx, ty, tz, domain)
     c_lagrange = np.array(transform_c(domain.field(state, 'c'),mod))
+
+    segm_data = np.ceil(segm_data).astype(int)
+    mask_for_cm = np.isin(segm_data, [1, 4])
+    # If there is no 1 or 4 in segm_data, switch to checking for 3
+    if not mask_for_cm.any():
+        mask_for_cm = np.isin(segm_data, [3])
+    CM_pos = center_of_mass(mask_for_cm)
+
     # Select a middle slice for visualization
-    CM_pos = center_of_mass(np.where(segm_data == 4, 1,0))
     middle_z = int(CM_pos[2])
     fig, axes = plt.subplots(7, 7, figsize=(14, 14))
     extent = [domain.lower[1], domain.upper[1], domain.lower[2], domain.upper[2]]
@@ -2051,7 +2059,13 @@ def process_data(args, matter_th):
     outside_matter_mask = (wm_data + gm_data < matter_th).astype(int)
     print("Outside matter mask unique values:", np.unique(outside_matter_mask))
 
-    CM_pos = center_of_mass(np.where(segm_data == 4, 1, 0))
+    segm_data = np.ceil(segm_data).astype(int)
+    mask_for_cm = np.isin(segm_data, [1, 4])
+    # If there is no 1 or 4 in segm_data, switch to checking for 3
+    if not mask_for_cm.any():
+        mask_for_cm = np.isin(segm_data, [3])
+    CM_pos = center_of_mass(mask_for_cm)
+
     middle_z = int(CM_pos[2])
     print(f"Center of mass position: {CM_pos}, middle_z: {middle_z}")
 
